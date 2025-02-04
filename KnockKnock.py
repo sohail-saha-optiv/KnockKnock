@@ -1,0 +1,456 @@
+#!/usr/bin/python3
+
+import requests,argparse,urllib3,json,threading,sys,re,logging,os,subprocess,time
+from pathlib import Path
+from alive_progress import alive_bar
+from argparse import RawTextHelpFormatter
+from selenium import webdriver
+from selenium.webdriver.firefox.service import Service
+from selenium.webdriver.firefox.options import Options
+from webdriver_manager.firefox import GeckoDriverManager
+from threading import Thread, Event
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+banner = r"""
+  _  __                 _    _  __                 _
+ | |/ /_ __   ___   ___| | _| |/ /_ __   ___   ___| | __
+ | ' /| '_ \ / _ \ / __| |/ / ' /| '_ \ / _ \ / __| |/ /
+ | . \| | | | (_) | (__|   <| . \| | | | (_) | (__|   <
+ |_|\_\_| |_|\___/ \___|_|\_\_|\_\_| |_|\___/ \___|_|\_\\
+    v1.0                                  @waffl3ss"""
+print(banner)
+print("\n")
+
+parser = argparse.ArgumentParser(formatter_class=RawTextHelpFormatter)
+parser.add_argument('--teams', dest='runTeams', required=False, default=False, help="Run the Teams User Enumeration Module", action="store_true")
+parser.add_argument('--onedrive', dest='runOneDrive', required=False, default=False, help="Run the One Drive Enumeration Module", action="store_true")
+parser.add_argument('-l', dest='teamsLegacy', required=False, default=False, help="Write legacy skype users to a seperate file", action="store_true")
+parser.add_argument('-s', dest='teamsStatus', required=False, default=False, help="Write Teams Status for users to a seperate file", action="store_true")
+parser.add_argument('-i', dest='inputList', type=argparse.FileType('r'), required=True, default='', help="Input file with newline-seperated users to check")
+parser.add_argument('-o', dest='outputfile', type=str, required=False, default='', help="Write output to file")
+parser.add_argument('-d', dest='targetDomain', type=str, required=True, default='', help="Domain to target")
+parser.add_argument('-t', dest='teamsToken', required=False, default='', help="Teams Token, either file, string, or 'proxy' for interactive Firefox")
+parser.add_argument('--threads', dest='maxThreads', required=False, type=int, default=10, help="Number of threads to use in the Teams User Enumeration (default = 10)")
+parser.add_argument('-v', dest='verboseMode', required=False, default=False, help="Show verbose errors", action="store_true")
+args = parser.parse_args()
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+if args.verboseMode:
+	logger.setLevel(logging.DEBUG)
+ 
+if not args.runTeams and not args.runOneDrive:
+    logger.error("You must select one enumeration module, Teams or OneDrive... Exiting...")
+    sys.exit()
+
+if args.runTeams and args.teamsToken == '':
+    logger.error("Teams Bearer Token required for Teams enumeration, Exiting...")
+    sys.exit()
+
+if args.teamsLegacy and args.outputfile == '':
+    logger.error("Teams Legacy Output requires the output file option (-o). Exiting...")
+    sys.exit()
+
+if args.teamsStatus and args.outputfile == '':
+    logger.error("Teams Status Output requires the output file option (-o). Exiting...")
+    sys.exit()
+
+MITMPROXY_PORT=8000
+
+inputNames = []
+nameList = []
+validNames = []
+legacyNames = []
+statusNames = []
+
+for name in args.inputList.readlines():
+    inputNames.append(name)
+
+def OneDriveEnumerator(targetTenant, potentialNameOD):
+    try:
+        testURL = "https://" + targetTenant + "-my.sharepoint.com/personal/" + str(potentialNameOD.replace(".","_")) + "_" + str(args.targetDomain.replace(".","_")) + "/_layouts/15/onedrive.aspx"
+        logger.debug("Testing: " + str(testURL))
+        userRequest = requests.get(testURL, verify=False)
+        if userRequest.status_code in [200, 401, 403, 302]:
+            logger.info(" [+] " + str(str(potentialNameOD) + "@" + str(args.targetDomain)))
+            validNames.append(str(potentialNameOD))
+        else:
+            logger.debug(" [-] " + str(str(potentialNameOD) + "@" + str(args.targetDomain)))
+            pass
+        bar()
+
+    except Exception as e:
+        logger.debug("[V] " + str(e))
+        pass
+    
+    finally:
+        bar()
+
+def getPresence(mri, bearer):
+    URL_PRESENCE_TEAMS = "https://presence.teams.microsoft.com/v1/presence/getpresence/"
+
+    initHeaders = {
+        "x-ms-client-version": "CLIENT_VERSION",
+        "Authorization": "Bearer " + bearer,
+        "Content-Type": "application/json",
+    }   
+
+    json_data = json.dumps([{"mri": mri}])
+    
+    try:
+        response = requests.post(URL_PRESENCE_TEAMS, data=json_data, headers=initHeaders)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        logger.debug(f"Error on response. [ERROR] - {e}")
+        return None, None
+
+    try:
+        status = response.json()
+
+        try:
+            availability = status[0]['presence']['availability']
+        except (KeyError, IndexError, TypeError):
+            availability = None
+
+        try:
+            device_type = status[0]['presence']['deviceType']
+        except (KeyError, IndexError, TypeError):
+            device_type = None
+
+        try:
+            out_of_office_note = str(status[0]['presence'].get('calendarData', {}).get('outOfOfficeNote', {}).get('message'))
+        except (KeyError, IndexError, TypeError):
+            out_of_office_note = None
+        
+        return availability, device_type, out_of_office_note
+    
+    except (json.JSONDecodeError, KeyError, IndexError) as e:
+        logger.debug(f"Error parsing response JSON [ERROR] - {e}")
+        return None, None, None
+
+
+def teamsEnum(theToken, potentialUserNameTeams):
+    try:
+        logger.debug(" [V] Testing user %s" % potentialUserNameTeams)
+
+        URL_TEAMS = "https://teams.microsoft.com/api/mt/emea/beta/users/"
+        CLIENT_VERSION = "27/1.0.0.2021011237"
+        
+        initHeaders = {
+            "Host": "teams.microsoft.com",
+            "Authorization": "Bearer " + theToken.strip(),
+            "X-Ms-Client-Version": str(CLIENT_VERSION),
+        }
+
+        initRequest = requests.get(URL_TEAMS + str(potentialUserNameTeams) + "/externalsearchv3?includeTFLUsers=true", headers=initHeaders)
+        if initRequest.status_code == 403:
+            logger.info(" [+] %s" % potentialUserNameTeams)
+            validNames.append(str(potentialUserNameTeams.split("@")[0]))
+
+        elif initRequest.status_code == 404:
+            logger.debug(" Error with username - %s" % str(potentialUserNameTeams))
+
+        elif initRequest.status_code == 200:
+            statusLevel = json.loads(initRequest.text)
+
+            if statusLevel:
+                if "skypeId" in statusLevel[0]:
+                    logger.info(" [+] %s -- Legacy Skype Detected" % potentialUserNameTeams)
+                    validNames.append(str(potentialUserNameTeams.split("@")[0]))
+                    legacyNames.append(str(potentialUserNameTeams.split("@")[0]))
+                    logger.debug(json.dumps(statusLevel, indent=2))
+                else:
+                    if not args.teamsStatus:
+                        logger.info(" [+] %s" % potentialUserNameTeams)
+                        validNames.append(str(potentialUserNameTeams.split("@")[0]))
+                        logger.debug(json.dumps(statusLevel, indent=2))
+
+                if args.teamsStatus:
+                    mriStatus = statusLevel[0].get("mri")
+                    availability, device_type, out_of_office_note = getPresence(mriStatus, theToken)
+                    if out_of_office_note is None:
+                        logger.info(f" [+] %s -- %s -- %s" % (potentialUserNameTeams, availability, device_type))
+                        statusNames.append(f"{potentialUserNameTeams} -- {availability} -- {device_type}")
+                    if out_of_office_note is not None:
+                        logger.info(" [+] %s -- %s -- %s -- %s" % (potentialUserNameTeams, availability, device_type, repr(out_of_office_note)))
+                        statusNames.append(f"{potentialUserNameTeams} -- {availability} -- {device_type} -- {repr(out_of_office_note)}")
+                    validNames.append(str(potentialUserNameTeams.split("@")[0]))
+            else:
+                logger.debug(" [-] %s" % potentialUserNameTeams)
+
+        elif initRequest.status_code == 401:
+            logger.error(" Error with Teams Auth Token... \n\tShutting down threads and Exiting")
+            sys.exit()
+        
+    except Exception as e:
+        logger.debug(" [V] " + str(e))
+        pass
+    
+    finally:
+        bar2()       
+            
+def start_mitmproxy(debug, exit_event):
+    mitmproxy_script = os.path.join(os.getcwd(), "mitmproxy_addon.py")
+
+    with open(mitmproxy_script, "w") as f:
+        f.write('''
+from mitmproxy import http
+import os
+
+def request(flow: http.HTTPFlow):
+    if "/api/csa/amer/api/v1/teams/" in flow.request.path:
+        auth_header = flow.request.headers.get("Authorization")
+        if auth_header:
+            with open("token.txt", "w") as token_file:
+                token_file.write(auth_header)
+            os._exit(0)
+''')
+
+    def run_mitmproxy():
+        cmd = [
+            "mitmdump",
+            "-s", mitmproxy_script,
+            "--mode", "regular",
+            "--listen-port", str(MITMPROXY_PORT),
+            "--ssl-insecure",
+            "--set", "termlog_verbosity=error"
+        ]
+        if not debug:
+            cmd.extend([">", "/dev/null", "2>&1"])
+        logger.info("Starting mitmproxy...")
+        subprocess.run(cmd)
+        exit_event.set()
+
+    thread = Thread(target=run_mitmproxy)
+    thread.daemon = True
+    thread.start()
+    time.sleep(3)
+    
+def setup_firefox_options():
+    options = Options()
+    options.set_preference("security.enterprise_roots.enabled", True)
+    options.set_preference("network.proxy.type", 1)
+    options.set_preference("network.proxy.http", "localhost")
+    options.set_preference("network.proxy.http_port", MITMPROXY_PORT)
+    options.set_preference("network.proxy.ssl", "localhost")
+    options.set_preference("network.proxy.ssl_port", MITMPROXY_PORT)
+    options.set_preference("network.cookie.cookieBehavior", 0)
+    options.set_preference("dom.security.https_only_mode", False)
+    options.set_preference("privacy.trackingprotection.enabled", False)
+    return options
+
+def start_firefox(options):
+    service = Service(GeckoDriverManager().install())
+    driver = webdriver.Firefox(service=service, options=options)
+    return driver
+
+def main():
+    global nameList
+    global bar 
+    global bar2
+    
+    nameList = list(set([name.strip().lower().split("@")[0] for name in inputNames]))
+
+    if args.teamsStatus:
+        logger.info(" Username -- Availability -- Device Type -- Out of Office Note\n")
+
+    if args.runOneDrive:
+        try:
+            logger.debug(" [V] Running OneDrive Enumeration")
+
+            tenantData = f"""<?xml version="1.0" encoding="utf-8"?>
+                <soap:Envelope xmlns:exm="http://schemas.microsoft.com/exchange/services/2006/messages" xmlns:ext="http://schemas.microsoft.com/exchange/services/2006/types" xmlns:a="http://www.w3.org/2005/08/addressing" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+                    <soap:Header>
+                        <a:Action soap:mustUnderstand="1">http://schemas.microsoft.com/exchange/2010/Autodiscover/Autodiscover/GetFederationInformation</a:Action>
+                        <a:To soap:mustUnderstand="1">https://autodiscover-s.outlook.com/autodiscover/autodiscover.svc</a:To>
+                        <a:ReplyTo>
+                            <a:Address>http://www.w3.org/2005/08/addressing/anonymous</a:Address>
+                        </a:ReplyTo>
+                    </soap:Header>
+                    <soap:Body>
+                        <GetFederationInformationRequestMessage xmlns="http://schemas.microsoft.com/exchange/2010/Autodiscover">
+                            <Request>
+                                <Domain>{args.targetDomain}</Domain>
+                            </Request>
+                        </GetFederationInformationRequestMessage>
+                    </soap:Body>
+                </soap:Envelope>"""
+
+            tenantHeaders = {
+                "Content-Type": "text/xml; charset=utf-8",
+                "SOAPAction": '"http://schemas.microsoft.com/exchange/2010/Autodiscover/Autodiscover/GetFederationInformation"',
+                "User-Agent": "AutodiscoverClient",
+                "Accept-Encoding": "identity",
+                }
+
+            try:
+                tenantRequest = requests.post("https://autodiscover-s.outlook.com/autodiscover/autodiscover.svc",headers=tenantHeaders,data=tenantData)
+                tenantRE = re.compile(r"<Domain>([^<>/]*)</Domain>", re.I)
+                tenantDomainList = list(set(tenantRE.findall(tenantRequest.text)))
+                for domain in tenantDomainList:
+                    if domain.lower().endswith(".onmicrosoft.com"):
+                        targetTenant = domain.split(".")[0]
+            except Exception as e:
+                logger.error(" Error retrieving tenant for target, Exiting...")
+                logger.debug(" [V] " + str(e))
+                sys.exit()
+
+            logger.debug(" [V] Using target tenant %s" % targetTenant)
+            logger.debug(" [V] Running OneDrive Enumeration using %i threads" % args.maxThreads)
+            
+            with alive_bar(len(nameList), title="Enumerating OneDrive Users", enrich_print=False) as bar:
+                threads = []
+                max_threads = args.maxThreads
+                for potentialNameOD in nameList:
+                    while threading.active_count() >= max_threads + 1:
+                        pass
+
+                    thread = threading.Thread(target=OneDriveEnumerator, args=(targetTenant, potentialNameOD,))
+                    thread.start()
+                    threads.append(thread)
+
+                for thread in threads:
+                    thread.join()
+
+        except Exception as e:
+            logger.error(" Error running OneDrive Enumeration")
+            logger.debug(" " + str(e))
+
+    if args.runOneDrive and args.runTeams:
+        nameList = [i for i in nameList if i not in validNames]
+
+    if args.runTeams:
+        try:
+            if Path(args.teamsToken).is_file():
+                tokenFile = open(args.teamsToken, 'r')
+                theToken = str(tokenFile.read())
+                if "Bearer" in theToken:
+                    theToken = theToken.replace("Bearer%3D","").replace("%26Origin%3Dhttps%3A%2F%2Fteams.microsoft.com","").replace("Bearer ","")
+            
+            elif args.teamsToken == 'proxy':
+                exit_event = Event()
+                start_mitmproxy(args.verboseMode, exit_event)
+                options = setup_firefox_options()
+                driver = start_firefox(options)
+                
+                try:
+                    logger.info("Opening Teams in Firefox...")
+                    driver.get("https://teams.microsoft.com")
+                    logger.info("Waiting for authorization token...")
+                    exit_event.wait()
+                    logger.info("Token captured to token.txt")
+                except Exception as e:
+                    logger.error(f"Error: {e}")
+                finally:
+                    logger.info("Closing Firefox and stopping mitmproxy...")
+                    driver.quit()
+                    subprocess.run(["pkill", "mitmdump"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    os.remove("mitmproxy_addon.py")
+                
+                    tokenFile = open("token.txt", 'r')
+                    theToken = str(tokenFile.read())
+                    theToken = theToken.replace("Bearer ","")
+
+            else:
+                theToken = str(args.teamsToken)
+                if "Bearer%3D" in theToken:
+                    theToken = theToken.replace("Bearer%3D","").replace("%26Origin%3Dhttps%3A%2F%2Fteams.microsoft.com","").replace("Bearer ","")
+            
+            logger.debug(" Running Teams User Enumeration using %i threads" % args.maxThreads)
+
+            with alive_bar(len(nameList), title="Enumerating Teams Users", enrich_print=False) as bar2:
+                threads = []
+                max_threads = args.maxThreads
+                for potentialUserNameTeams in nameList:
+                    teamsEnumUser = str(potentialUserNameTeams.strip()) + str("@") + str(args.targetDomain)
+                    while threading.active_count() >= max_threads + 1:
+                        pass
+
+                    thread = threading.Thread(target=teamsEnum, args=(theToken, teamsEnumUser,))
+                    thread.start()
+                    threads.append(thread)
+
+                for thread in threads:
+                    thread.join()
+
+        except Exception as e:
+            logger.error(" Error running Teams Enumeration")
+            logger.debug(" " + str(e))
+
+    if validNames:
+        if args.outputfile != '':
+            overwriteOutputFile = True
+            if Path.exists(Path(args.outputfile)):
+                overwriteOutFileChoice = input(" [!] Output File exists, overwrite? [Y/n] ")
+                if overwriteOutFileChoice == "y" or "Y" or "":
+                    overwriteOutputFile = True
+                    Path(args.outputfile).unlink(missing_ok=True)
+                else:
+                    overwriteOutputFile = False
+
+            if overwriteOutputFile:
+                logger.debug(" Running deduplication and writing names to file")
+                validNamesUnique = list(dict.fromkeys(validNames))
+                with open(args.outputfile, 'w') as outfile:
+                    for item in validNamesUnique:
+                        outfile.write(item + "@" + args.targetDomain + "\n")
+                outfile.close()
+            else:
+                logger.info(" Not overwriting output file")
+
+    if args.teamsLegacy:
+        if legacyNames:
+            if args.outputfile != '':
+                legacyOutFile = "Legacy_" + str(args.outputfile)
+                legacyOverwriteFile = True
+
+                if Path.exists(Path(legacyOutFile)):
+                    legOverwriteChoice = input("[!] Legacy Output File exists, overwrite? [Y/n] ")
+                    if legOverwriteChoice == "y" or "Y" or "":
+                        legacyOverwriteFile = True
+                        Path(legacyOutFile).unlink(missing_ok=True)
+                    else:
+                        legacyOverwriteFile = False
+
+                if legacyOverwriteFile:
+                    logger.debug(" Found %i Legacy Skype Users, creating file with names" % len(legacyNames))
+                    legacyNamesUniq = list(dict.fromkeys(legacyNames))
+                    with open(legacyOutFile, "w") as legOut:
+                        for legName in legacyNamesUniq:
+                            legOut.write(legName + "@" + args.targetDomain + "\n")
+                    legOut.close()
+                else:
+                    logger.info(" Not overwriting legacy skype users file")
+        else:
+            logger.info(" No legacy skype users identified")
+
+    if args.teamsStatus:
+        if statusNames:
+            if args.outputfile != '':
+                statusOutFile = "Status_" + str(args.outputfile)
+                statusOverwriteFile = True
+
+                if Path.exists(Path(statusOutFile)):
+                    statusOverwriteChoice = input(" [!] Status Output File exists, overwrite? [Y/n] ")
+                    if statusOverwriteChoice == "y" or "Y" or "":
+                        statusOverwriteFile = True
+                        Path(statusOutFile).unlink(missing_ok=True)
+                    else:
+                        statusOverwriteFile = False
+
+                if statusOverwriteFile:
+                    titleLine = "Username -- Availability -- Device Type -- Out of Office Note\n"
+                    with open(statusOutFile, "a+") as statusOut:
+                        statusOut.write(titleLine)
+                    logger.debug(" Found %i Users with status information, creating file with names" % len(statusNames))
+                    statusNamesUniq = list(dict.fromkeys(statusNames))
+                    with open(statusOutFile, "a+") as statusOut:
+                        for statusName in statusNamesUniq:
+                            statusOut.write(statusName + "\n")
+                    statusOut.close()
+                else:
+                    logger.info(" Not overwriting status file")
+
+if __name__ == "__main__":
+    main()
