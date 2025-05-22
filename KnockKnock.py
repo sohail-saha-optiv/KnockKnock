@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-import requests,argparse,urllib3,json,threading,sys,re,logging,os,subprocess,time
+import os,re,sys,json,time,logging,contextlib,subprocess,argparse,urllib3,requests
 from pathlib import Path
 from alive_progress import alive_bar
 from argparse import RawTextHelpFormatter
@@ -9,6 +9,8 @@ from selenium.webdriver.firefox.service import Service
 from selenium.webdriver.firefox.options import Options
 from webdriver_manager.firefox import GeckoDriverManager
 from threading import Thread, Event
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 banner = r"""
@@ -17,7 +19,7 @@ banner = r"""
  | ' /| '_ \ / _ \ / __| |/ / ' /| '_ \ / _ \ / __| |/ /
  | . \| | | | (_) | (__|   <| . \| | | | (_) | (__|   <
  |_|\_\_| |_|\___/ \___|_|\_\_|\_\_| |_|\___/ \___|_|\_\\
-    v1.0                                  @waffl3ss"""
+    v1.1                                  @waffl3ss"""
 print(banner)
 print("\n")
 
@@ -74,18 +76,14 @@ def OneDriveEnumerator(targetTenant, potentialNameOD):
         userRequest = requests.get(testURL, verify=False)
         if userRequest.status_code in [200, 401, 403, 302]:
             logger.info(" [+] " + str(str(potentialNameOD) + "@" + str(args.targetDomain)))
-            validNames.append(str(potentialNameOD))
+            validNames.append(potentialNameOD.strip().lower())
         else:
             logger.debug(" [-] " + str(str(potentialNameOD) + "@" + str(args.targetDomain)))
             pass
-        bar()
 
     except Exception as e:
         logger.debug("[V] " + str(e))
         pass
-    
-    finally:
-        bar()
 
 def getPresence(mri, bearer):
     URL_PRESENCE_TEAMS = "https://presence.teams.microsoft.com/v1/presence/getpresence/"
@@ -145,11 +143,11 @@ def teamsEnum(theToken, potentialUserNameTeams):
 
         initRequest = requests.get(URL_TEAMS + str(potentialUserNameTeams) + "/externalsearchv3?includeTFLUsers=true", headers=initHeaders)
         if initRequest.status_code == 403:
-            logger.info(" [+] %s" % potentialUserNameTeams)
-            validNames.append(str(potentialUserNameTeams.split("@")[0]))
+            logger.info(" [+] %s" % potentialUserNameTeams.strip().lower())
+            validNames.append(str(potentialUserNameTeams.split("@")[0].strip().lower()))
 
         elif initRequest.status_code == 404:
-            logger.debug(" Error with username - %s" % str(potentialUserNameTeams))
+            logger.debug(" Error with username - %s" % str(potentialUserNameTeams.strip().lower()))
 
         elif initRequest.status_code == 200:
             statusLevel = json.loads(initRequest.text)
@@ -157,27 +155,27 @@ def teamsEnum(theToken, potentialUserNameTeams):
             if statusLevel:
                 if "skypeId" in statusLevel[0]:
                     logger.info(" [+] %s -- Legacy Skype Detected" % potentialUserNameTeams)
-                    validNames.append(str(potentialUserNameTeams.split("@")[0]))
-                    legacyNames.append(str(potentialUserNameTeams.split("@")[0]))
+                    validNames.append(potentialUserNameTeams.split("@")[0].strip().lower())
+                    legacyNames.append(potentialUserNameTeams.split("@")[0].strip().lower())
                     logger.debug(json.dumps(statusLevel, indent=2))
                 else:
                     if not args.teamsStatus:
                         logger.info(" [+] %s" % potentialUserNameTeams)
-                        validNames.append(str(potentialUserNameTeams.split("@")[0]))
+                        validNames.append(str(potentialUserNameTeams.split("@")[0].strip().lower()))
                         logger.debug(json.dumps(statusLevel, indent=2))
 
                 if args.teamsStatus:
                     mriStatus = statusLevel[0].get("mri")
                     availability, device_type, out_of_office_note = getPresence(mriStatus, theToken)
                     if out_of_office_note is None:
-                        logger.info(f" [+] %s -- %s -- %s" % (potentialUserNameTeams, availability, device_type))
-                        statusNames.append(f"{potentialUserNameTeams} -- {availability} -- {device_type}")
+                        logger.info(f" [+] %s -- %s -- %s" % (potentialUserNameTeams.strip(), availability, device_type))
+                        statusNames.append(f"{potentialUserNameTeams.strip().lower()} -- {availability} -- {device_type}")
                     if out_of_office_note is not None:
-                        logger.info(" [+] %s -- %s -- %s -- %s" % (potentialUserNameTeams, availability, device_type, repr(out_of_office_note)))
-                        statusNames.append(f"{potentialUserNameTeams} -- {availability} -- {device_type} -- {repr(out_of_office_note)}")
-                    validNames.append(str(potentialUserNameTeams.split("@")[0]))
+                        logger.info(" [+] %s -- %s -- %s -- %s" % (potentialUserNameTeams.strip().lower(), availability, device_type, repr(out_of_office_note)))
+                        statusNames.append(f"{potentialUserNameTeams.strip().lower()} -- {availability} -- {device_type} -- {repr(out_of_office_note)}")
+                    validNames.append(str(potentialUserNameTeams.split("@")[0].strip().lower()))
             else:
-                logger.debug(" [-] %s" % potentialUserNameTeams)
+                logger.debug(" [-] %s" % potentialUserNameTeams.strip().lower())
 
         elif initRequest.status_code == 401:
             logger.error(" Error with Teams Auth Token... \n\tShutting down threads and Exiting")
@@ -185,10 +183,7 @@ def teamsEnum(theToken, potentialUserNameTeams):
         
     except Exception as e:
         logger.debug(" [V] " + str(e))
-        pass
-    
-    finally:
-        bar2()       
+        pass      
             
 def start_mitmproxy(debug, exit_event):
     mitmproxy_script = os.path.join(os.getcwd(), "mitmproxy_addon.py")
@@ -240,8 +235,16 @@ def setup_firefox_options():
     options.set_preference("privacy.trackingprotection.enabled", False)
     return options
 
+@contextlib.contextmanager
+def suppress_stdout_stderr():
+    with open(os.devnull, 'w') as devnull:
+        with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+            yield
+
 def start_firefox(options):
-    service = Service(GeckoDriverManager().install())
+    logging.getLogger("WDM").setLevel(logging.CRITICAL)
+    with suppress_stdout_stderr():
+        service = Service(GeckoDriverManager().install())
     driver = webdriver.Firefox(service=service, options=options)
     return driver
 
@@ -300,18 +303,16 @@ def main():
             logger.debug(" [V] Running OneDrive Enumeration using %i threads" % args.maxThreads)
             
             with alive_bar(len(nameList), title="Enumerating OneDrive Users", enrich_print=False) as bar:
-                threads = []
-                max_threads = args.maxThreads
-                for potentialNameOD in nameList:
-                    while threading.active_count() >= max_threads + 1:
+                def wrapped_onedrive(name):
+                    try:
+                        OneDriveEnumerator(targetTenant, name)
+                    finally:
+                        bar()
+
+                with ThreadPoolExecutor(max_workers=args.maxThreads) as executor:
+                    futures = [executor.submit(wrapped_onedrive, name) for name in nameList]
+                    for future in as_completed(futures):
                         pass
-
-                    thread = threading.Thread(target=OneDriveEnumerator, args=(targetTenant, potentialNameOD,))
-                    thread.start()
-                    threads.append(thread)
-
-                for thread in threads:
-                    thread.join()
 
         except Exception as e:
             logger.error(" Error running OneDrive Enumeration")
@@ -322,11 +323,11 @@ def main():
 
     if args.runTeams:
         try:
-            if Path(args.teamsToken).is_file():
+            if len(args.teamsToken) < 150 and Path(args.teamsToken).is_file():
                 tokenFile = open(args.teamsToken, 'r')
                 theToken = str(tokenFile.read())
                 if "Bearer" in theToken:
-                    theToken = theToken.replace("Bearer%3D","").replace("%26Origin%3Dhttps%3A%2F%2Fteams.microsoft.com","").replace("Bearer ","")
+                    theToken = theToken.replace("Bearer%3D","").replace("%26Origin%3Dhttps%3A%2F%2Fteams.microsoft.com","").replace("%26origin%3Dhttps%3A%2F%2Fteams.microsoft.com","").replace("Bearer ","").strip()
             
             elif args.teamsToken == 'proxy':
                 exit_event = Event()
@@ -354,25 +355,23 @@ def main():
 
             else:
                 theToken = str(args.teamsToken)
-                if "Bearer%3D" in theToken:
-                    theToken = theToken.replace("Bearer%3D","").replace("%26Origin%3Dhttps%3A%2F%2Fteams.microsoft.com","").replace("Bearer ","")
+                if "Bearer" in theToken:
+                    theToken = theToken.replace("Bearer%3D","").replace("%26Origin%3Dhttps%3A%2F%2Fteams.microsoft.com","").replace("%26origin%3Dhttps%3A%2F%2Fteams.microsoft.com","").replace("Bearer ","").strip()
             
             logger.debug(" Running Teams User Enumeration using %i threads" % args.maxThreads)
-
+          
             with alive_bar(len(nameList), title="Enumerating Teams Users", enrich_print=False) as bar2:
-                threads = []
-                max_threads = args.maxThreads
-                for potentialUserNameTeams in nameList:
-                    teamsEnumUser = str(potentialUserNameTeams.strip()) + str("@") + str(args.targetDomain)
-                    while threading.active_count() >= max_threads + 1:
+                def wrapped_teams(user):
+                    try:
+                        teamsEnumUser = f"{user.strip()}@{args.targetDomain}"
+                        teamsEnum(theToken, teamsEnumUser)
+                    finally:
+                        bar2()
+
+                with ThreadPoolExecutor(max_workers=args.maxThreads) as executor:
+                    futures = [executor.submit(wrapped_teams, name) for name in nameList]
+                    for future in as_completed(futures):
                         pass
-
-                    thread = threading.Thread(target=teamsEnum, args=(theToken, teamsEnumUser,))
-                    thread.start()
-                    threads.append(thread)
-
-                for thread in threads:
-                    thread.join()
 
         except Exception as e:
             logger.error(" Error running Teams Enumeration")
