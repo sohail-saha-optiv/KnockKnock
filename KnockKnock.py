@@ -184,7 +184,9 @@ def teamsEnum(theToken, potentialUserNameTeams):
     except Exception as e:
         logger.debug(" [V] " + str(e))
         pass      
-            
+
+
+       
 def start_mitmproxy(debug, exit_event):
     mitmproxy_script = os.path.join(os.getcwd(), "mitmproxy_addon.py")
 
@@ -193,13 +195,18 @@ def start_mitmproxy(debug, exit_event):
 from mitmproxy import http
 import os
 
-def request(flow: http.HTTPFlow):
-    if "/api/csa/amer/api/v1/teams/" in flow.request.path:
-        auth_header = flow.request.headers.get("Authorization")
-        if auth_header:
-            with open("token.txt", "w") as token_file:
-                token_file.write(auth_header)
-            os._exit(0)
+def response(flow: http.HTTPFlow):
+    if "/oauth2/v2.0/token?client-request-id=" in flow.request.path:
+        if flow.response and b"skype" in flow.response.content:
+            try:
+                token_json = flow.response.json()
+                access_token = token_json.get("access_token")
+                if access_token:
+                    with open("token.txt", "w") as token_file:
+                        token_file.write("Bearer " + access_token)
+                    os._exit(0)
+            except Exception as e:
+                pass
 ''')
 
     def run_mitmproxy():
@@ -221,7 +228,7 @@ def request(flow: http.HTTPFlow):
     thread.daemon = True
     thread.start()
     time.sleep(3)
-    
+
 def setup_firefox_options():
     options = Options()
     options.set_preference("security.enterprise_roots.enabled", True)
