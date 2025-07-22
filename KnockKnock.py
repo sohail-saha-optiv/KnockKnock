@@ -255,11 +255,62 @@ def start_firefox(options):
     driver = webdriver.Firefox(service=service, options=options)
     return driver
 
+def get_tenant_name(target_domain):
+    logger.debug(" [V] Method 1: SharePoint Discovery...")
+    try:
+        sharepoint_url = f"https://{target_domain.split('.')[0]}-my.sharepoint.com"
+        response = requests.get(sharepoint_url, timeout=10, allow_redirects=False, verify=False)
+
+        if response.status_code == 302:
+            location = response.headers.get('location', '')
+            logger.debug(f" [V] SharePoint redirect: {location}")
+
+            tenant_match = re.search(r'https://([^-]+)-my\.sharepoint\.com', location)
+            if tenant_match:
+                tenant_name = tenant_match.group(1)
+                logger.debug(f" [V] SUCCESS: Found tenant via SharePoint: {tenant_name}")
+                return tenant_name
+            else:
+                logger.debug(" [V] FAIL: Could not extract tenant from SharePoint redirect")
+        else:
+            logger.debug(f" [V] FAIL: SharePoint response status: {response.status_code}")
+
+    except Exception as e:
+        logger.debug(f" [V] FAIL: SharePoint discovery failed: {e}")
+
+    logger.debug(" [V] Method 2: Pattern Probing (backup)...")
+    common_patterns = [
+        target_domain.split('.')[0],
+        target_domain.split('.')[0].replace('-', ''),
+        target_domain.replace('.com', '').replace('.', ''),
+        target_domain.replace('.', ''),
+    ]
+
+    for i, pattern in enumerate(common_patterns):
+        logger.debug(f" [V] Testing pattern {i+1}: {pattern}")
+        try:
+            test_url = f"https://{pattern}-my.sharepoint.com"
+            test_response = requests.get(test_url, timeout=5, allow_redirects=False, verify=False)
+
+            if test_response.status_code in [302, 200, 401, 403]:
+                logger.debug(f" [V] SUCCESS: Found working tenant pattern: {pattern} (HTTP {test_response.status_code})")
+                return pattern
+            else:
+                logger.debug(f" [V] FAIL: Pattern {pattern} returned HTTP {test_response.status_code}")
+
+        except Exception as e:
+            logger.debug(f" [V] ERROR: Pattern {pattern} failed: {e}")
+            continue
+
+    fallback_tenant = target_domain.split('.')[0]
+    logger.debug(f" [V] FALLBACK: Using domain-based tenant: {fallback_tenant}")
+    return fallback_tenant
+
 def main():
     global nameList
-    global bar 
+    global bar
     global bar2
-    
+
     nameList = list(set([name.strip().lower().split("@")[0] for name in inputNames]))
 
     if args.teamsStatus:
@@ -269,38 +320,12 @@ def main():
         try:
             logger.debug(" [V] Running OneDrive Enumeration")
 
-            tenantData = f"""<?xml version="1.0" encoding="utf-8"?>
-                <soap:Envelope xmlns:exm="http://schemas.microsoft.com/exchange/services/2006/messages" xmlns:ext="http://schemas.microsoft.com/exchange/services/2006/types" xmlns:a="http://www.w3.org/2005/08/addressing" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
-                    <soap:Header>
-                        <a:Action soap:mustUnderstand="1">http://schemas.microsoft.com/exchange/2010/Autodiscover/Autodiscover/GetFederationInformation</a:Action>
-                        <a:To soap:mustUnderstand="1">https://autodiscover-s.outlook.com/autodiscover/autodiscover.svc</a:To>
-                        <a:ReplyTo>
-                            <a:Address>http://www.w3.org/2005/08/addressing/anonymous</a:Address>
-                        </a:ReplyTo>
-                    </soap:Header>
-                    <soap:Body>
-                        <GetFederationInformationRequestMessage xmlns="http://schemas.microsoft.com/exchange/2010/Autodiscover">
-                            <Request>
-                                <Domain>{args.targetDomain}</Domain>
-                            </Request>
-                        </GetFederationInformationRequestMessage>
-                    </soap:Body>
-                </soap:Envelope>"""
-
-            tenantHeaders = {
-                "Content-Type": "text/xml; charset=utf-8",
-                "SOAPAction": '"http://schemas.microsoft.com/exchange/2010/Autodiscover/Autodiscover/GetFederationInformation"',
-                "User-Agent": "AutodiscoverClient",
-                "Accept-Encoding": "identity",
-                }
-
             try:
-                tenantRequest = requests.post("https://autodiscover-s.outlook.com/autodiscover/autodiscover.svc",headers=tenantHeaders,data=tenantData)
-                tenantRE = re.compile(r"<Domain>([^<>/]*)</Domain>", re.I)
-                tenantDomainList = list(set(tenantRE.findall(tenantRequest.text)))
-                for domain in tenantDomainList:
-                    if domain.lower().endswith(".onmicrosoft.com"):
-                        targetTenant = domain.split(".")[0]
+                logger.debug(" [V] Discovering tenant for target domain")
+                targetTenant = get_tenant_name(args.targetDomain)
+                if not targetTenant:
+                    logger.error(" Error retrieving tenant for target, Exiting...")
+                    sys.exit()
             except Exception as e:
                 logger.error(" Error retrieving tenant for target, Exiting...")
                 logger.debug(" [V] " + str(e))
@@ -308,7 +333,7 @@ def main():
 
             logger.debug(" [V] Using target tenant %s" % targetTenant)
             logger.debug(" [V] Running OneDrive Enumeration using %i threads" % args.maxThreads)
-            
+
             with alive_bar(len(nameList), title="Enumerating OneDrive Users", enrich_print=False) as bar:
                 def wrapped_onedrive(name):
                     try:
@@ -335,13 +360,13 @@ def main():
                 theToken = str(tokenFile.read())
                 if "Bearer" in theToken:
                     theToken = theToken.replace("Bearer%3D","").replace("%26Origin%3Dhttps%3A%2F%2Fteams.microsoft.com","").replace("%26origin%3Dhttps%3A%2F%2Fteams.microsoft.com","").replace("Bearer ","").strip()
-            
+
             elif args.teamsToken == 'proxy':
                 exit_event = Event()
                 start_mitmproxy(args.verboseMode, exit_event)
                 options = setup_firefox_options()
                 driver = start_firefox(options)
-                
+
                 try:
                     logger.info("Opening Teams in Firefox...")
                     driver.get("https://teams.microsoft.com")
@@ -355,7 +380,7 @@ def main():
                     driver.quit()
                     subprocess.run(["pkill", "mitmdump"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     os.remove("mitmproxy_addon.py")
-                
+
                     tokenFile = open("token.txt", 'r')
                     theToken = str(tokenFile.read())
                     theToken = theToken.replace("Bearer ","")
@@ -364,9 +389,9 @@ def main():
                 theToken = str(args.teamsToken)
                 if "Bearer" in theToken:
                     theToken = theToken.replace("Bearer%3D","").replace("%26Origin%3Dhttps%3A%2F%2Fteams.microsoft.com","").replace("%26origin%3Dhttps%3A%2F%2Fteams.microsoft.com","").replace("Bearer ","").strip()
-            
+
             logger.debug(" Running Teams User Enumeration using %i threads" % args.maxThreads)
-          
+
             with alive_bar(len(nameList), title="Enumerating Teams Users", enrich_print=False) as bar2:
                 def wrapped_teams(user):
                     try:
