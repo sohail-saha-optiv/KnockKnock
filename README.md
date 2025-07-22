@@ -1,4 +1,4 @@
-# KnockKnock - v1.1 
+# KnockKnock - v1.2 
 
 #### Please make sure to actually utilize the README. 
 
@@ -8,6 +8,9 @@ It can also get details from Teams, such as availability, device type, and out o
 Finally, it also creates a nice clean list for future usage, all conducted from a single tool. 
 
 If youre having problems with the token, you didnt go through the README, or you didnt use the interactive firefox option.
+
+### v1.2 Update's
+- Microsoft changed things (as always) and had to figure out a new method of getting the TenantID to use in the OneDrive Enum stuffs.
 
 ### v1.1 Update's
 - Reiterate that the `-t proxy` option will get the token for you. This deffinatly works on a Kali GUI desktop. Microsoft keeps changing, and the location of the token moves, so this is the safest way to sureley grab it. 
@@ -44,7 +47,7 @@ If youre having problems with the token, you didnt go through the README, or you
  | ' /| '_ \ / _ \ / __| |/ / ' /| '_ \ / _ \ / __| |/ /
  | . \| | | | (_) | (__|   <| . \| | | | (_) | (__|   <
  |_|\_\_| |_|\___/ \___|_|\_\_|\_\_| |_|\___/ \___|_|\_\\
-    v1.1                                  @waffl3ss
+    v1.2                                  @waffl3ss
 
 usage: KK_Dev.py [-h] [--teams] [--onedrive] [-l] [-s] -i INPUTLIST [-o OUTPUTFILE] -d TARGETDOMAIN [-t TEAMSTOKEN] [--threads MAXTHREADS] [-v]
 
