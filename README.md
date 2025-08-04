@@ -2,6 +2,8 @@
 
 #### Please make sure to actually utilize the README. 
 
+#### As I learn GoLang, i'm writing some of my python tools in Go. You can find GoKnock (Go version of KnockKnock) [HERE](https://github.com/waffl3ss/GoKnock) 
+------------------------------------------------------------------------------------
 Designed to validate potential usernames by querying OneDrive and/or Microsoft Teams, which are passive methods.  
 It can output/create a list of legacy Skype users identified through Microsoft Teams enumeration.
 It can also get details from Teams, such as availability, device type, and out of office message.
@@ -9,6 +11,7 @@ Finally, it also creates a nice clean list for future usage, all conducted from 
 
 If youre having problems with the token, you didnt go through the README, or you didnt use the interactive firefox option.
 
+------------------------------------------------------------------------------------
 ### v1.2 Update's
 - Microsoft changed things (as always) and had to figure out a new method of getting the TenantID to use in the OneDrive Enum stuffs.
 
