@@ -60,14 +60,9 @@ if args.teamsStatus and args.outputfile == '':
 
 MITMPROXY_PORT=8000
 
-inputNames = []
-nameList = []
-validNames = []
-legacyNames = []
-statusNames = []
-
-for name in args.inputList.readlines():
-    inputNames.append(name)
+validNames = set()
+legacyNames = set()
+statusNames = set()
 
 def OneDriveEnumerator(targetTenant, potentialNameOD):
     try:
@@ -76,7 +71,7 @@ def OneDriveEnumerator(targetTenant, potentialNameOD):
         userRequest = requests.get(testURL, verify=False)
         if userRequest.status_code in [200, 401, 403, 302]:
             logger.info(" [+] " + str(str(potentialNameOD) + "@" + str(args.targetDomain)))
-            validNames.append(potentialNameOD.strip().lower())
+            validNames.add(potentialNameOD.strip().lower())
         else:
             logger.debug(" [-] " + str(str(potentialNameOD) + "@" + str(args.targetDomain)))
             pass
@@ -144,7 +139,7 @@ def teamsEnum(theToken, potentialUserNameTeams):
         initRequest = requests.get(URL_TEAMS + str(potentialUserNameTeams) + "/externalsearchv3?includeTFLUsers=true", headers=initHeaders)
         if initRequest.status_code == 403:
             logger.info(" [+] %s" % potentialUserNameTeams.strip().lower())
-            validNames.append(str(potentialUserNameTeams.split("@")[0].strip().lower()))
+            validNames.add(str(potentialUserNameTeams.split("@")[0].strip().lower()))
 
         elif initRequest.status_code == 404:
             logger.debug(" Error with username - %s" % str(potentialUserNameTeams.strip().lower()))
@@ -155,13 +150,13 @@ def teamsEnum(theToken, potentialUserNameTeams):
             if statusLevel:
                 if "skypeId" in statusLevel[0]:
                     logger.info(" [+] %s -- Legacy Skype Detected" % potentialUserNameTeams)
-                    validNames.append(potentialUserNameTeams.split("@")[0].strip().lower())
-                    legacyNames.append(potentialUserNameTeams.split("@")[0].strip().lower())
+                    validNames.add(potentialUserNameTeams.split("@")[0].strip().lower())
+                    legacyNames.add(potentialUserNameTeams.split("@")[0].strip().lower())
                     logger.debug(json.dumps(statusLevel, indent=2))
                 else:
                     if not args.teamsStatus:
                         logger.info(" [+] %s" % potentialUserNameTeams)
-                        validNames.append(str(potentialUserNameTeams.split("@")[0].strip().lower()))
+                        validNames.add(str(potentialUserNameTeams.split("@")[0].strip().lower()))
                         logger.debug(json.dumps(statusLevel, indent=2))
 
                 if args.teamsStatus:
@@ -169,11 +164,11 @@ def teamsEnum(theToken, potentialUserNameTeams):
                     availability, device_type, out_of_office_note = getPresence(mriStatus, theToken)
                     if out_of_office_note is None:
                         logger.info(f" [+] %s -- %s -- %s" % (potentialUserNameTeams.strip(), availability, device_type))
-                        statusNames.append(f"{potentialUserNameTeams.strip().lower()} -- {availability} -- {device_type}")
+                        statusNames.add(f"{potentialUserNameTeams.strip().lower()} -- {availability} -- {device_type}")
                     if out_of_office_note is not None:
                         logger.info(" [+] %s -- %s -- %s -- %s" % (potentialUserNameTeams.strip().lower(), availability, device_type, repr(out_of_office_note)))
-                        statusNames.append(f"{potentialUserNameTeams.strip().lower()} -- {availability} -- {device_type} -- {repr(out_of_office_note)}")
-                    validNames.append(str(potentialUserNameTeams.split("@")[0].strip().lower()))
+                        statusNames.add(f"{potentialUserNameTeams.strip().lower()} -- {availability} -- {device_type} -- {repr(out_of_office_note)}")
+                    validNames.add(str(potentialUserNameTeams.split("@")[0].strip().lower()))
             else:
                 logger.debug(" [-] %s" % potentialUserNameTeams.strip().lower())
 
@@ -306,16 +301,23 @@ def get_tenant_name(target_domain):
     logger.debug(f" [V] FALLBACK: Using domain-based tenant: {fallback_tenant}")
     return fallback_tenant
 
+def getNumOfLinesInFile(f):
+    numOfLines = 0
+    for _ in f:
+        numOfLines += 1
+    f.seek(0)
+    return numOfLines
+
 def main():
-    global nameList
     global bar
     global bar2
-
-    nameList = list(set([name.strip().lower().split("@")[0] for name in inputNames]))
 
     if args.teamsStatus:
         logger.info(" Username -- Availability -- Device Type -- Out of Office Note\n")
 
+    ###########
+    ## OneDrive
+    ###########
     if args.runOneDrive:
         try:
             logger.debug(" [V] Running OneDrive Enumeration")
@@ -333,26 +335,38 @@ def main():
 
             logger.debug(" [V] Using target tenant %s" % targetTenant)
             logger.debug(" [V] Running OneDrive Enumeration using %i threads" % args.maxThreads)
-
-            with alive_bar(len(nameList), title="Enumerating OneDrive Users", enrich_print=False) as bar:
-                def wrapped_onedrive(name):
-                    try:
-                        OneDriveEnumerator(targetTenant, name)
-                    finally:
-                        bar()
-
+                    
+            with alive_bar(getNumOfLinesInFile(args.inputList), title="Enumerating OneDrive Users", enrich_print=False) as bar:
                 with ThreadPoolExecutor(max_workers=args.maxThreads) as executor:
-                    futures = [executor.submit(wrapped_onedrive, name) for name in nameList]
-                    for future in as_completed(futures):
-                        pass
+                    batchedFutures = set()
+                    while True:
+                        while len(batchedFutures) < args.maxThreads:
+                            try:
+                                batchedFutures.add(
+                                    executor.submit(
+                                        OneDriveEnumerator,
+                                        targetTenant,
+                                        args.inputList.readline().strip().split("@")[0]
+                                        )
+                                )
+                            except:
+                                pass
+
+                        if len(batchedFutures) == 0:
+                            break
+
+                        for future in as_completed(batchedFutures):
+                            batchedFutures.remove(future)
+                            bar()
+                            break
 
         except Exception as e:
             logger.error(" Error running OneDrive Enumeration")
             logger.debug(" " + str(e))
 
-    if args.runOneDrive and args.runTeams:
-        nameList = [i for i in nameList if i not in validNames]
-
+    ########
+    ## Teams
+    ########
     if args.runTeams:
         try:
             if len(args.teamsToken) < 150 and Path(args.teamsToken).is_file():
@@ -391,25 +405,41 @@ def main():
                     theToken = theToken.replace("Bearer%3D","").replace("%26Origin%3Dhttps%3A%2F%2Fteams.microsoft.com","").replace("%26origin%3Dhttps%3A%2F%2Fteams.microsoft.com","").replace("Bearer ","").strip()
 
             logger.debug(" Running Teams User Enumeration using %i threads" % args.maxThreads)
-
-            with alive_bar(len(nameList), title="Enumerating Teams Users", enrich_print=False) as bar2:
-                def wrapped_teams(user):
-                    try:
-                        teamsEnumUser = f"{user.strip()}@{args.targetDomain}"
-                        teamsEnum(theToken, teamsEnumUser)
-                    finally:
-                        bar2()
-
+            args.inputList.seek(0)
+            with alive_bar(getNumOfLinesInFile(args.inputList), title="Enumerating Teams Users", enrich_print=False) as bar2:
                 with ThreadPoolExecutor(max_workers=args.maxThreads) as executor:
-                    futures = [executor.submit(wrapped_teams, name) for name in nameList]
-                    for future in as_completed(futures):
-                        pass
+                    batchedFutures = set()
+                    while True:
+                        while len(batchedFutures) < args.maxThreads:
+                            try:
+                                name = args.inputList.readline().strip().split("@")[0]
+                                if name not in validNames: # Skip names that OneDrive enumeration has already found
+                                    batchedFutures.add(
+                                        executor.submit(
+                                            teamsEnum,
+                                            theToken,
+                                            f"{name}@{args.targetDomain}",
+                                            )
+                                    )
+                            except:
+                                pass
+
+                        if len(batchedFutures) == 0:
+                            break
+
+                        for future in as_completed(batchedFutures):
+                            batchedFutures.remove(future)
+                            bar2()
+                            break
 
         except Exception as e:
             logger.error(" Error running Teams Enumeration")
             logger.debug(" " + str(e))
 
-    if validNames:
+    ####################
+    ## Aggregate results
+    ####################
+    if len(validNames) != 0:
         if args.outputfile != '':
             overwriteOutputFile = True
             if Path.exists(Path(args.outputfile)):
@@ -422,16 +452,15 @@ def main():
 
             if overwriteOutputFile:
                 logger.debug(" Running deduplication and writing names to file")
-                validNamesUnique = list(dict.fromkeys(validNames))
                 with open(args.outputfile, 'w') as outfile:
-                    for item in validNamesUnique:
+                    for item in validNames:
                         outfile.write(item + "@" + args.targetDomain + "\n")
                 outfile.close()
             else:
                 logger.info(" Not overwriting output file")
 
     if args.teamsLegacy:
-        if legacyNames:
+        if len(legacyNames) != 0:
             if args.outputfile != '':
                 legacyOutFile = "Legacy_" + str(args.outputfile)
                 legacyOverwriteFile = True
@@ -446,9 +475,8 @@ def main():
 
                 if legacyOverwriteFile:
                     logger.debug(" Found %i Legacy Skype Users, creating file with names" % len(legacyNames))
-                    legacyNamesUniq = list(dict.fromkeys(legacyNames))
                     with open(legacyOutFile, "w") as legOut:
-                        for legName in legacyNamesUniq:
+                        for legName in legacyNames:
                             legOut.write(legName + "@" + args.targetDomain + "\n")
                     legOut.close()
                 else:
@@ -457,7 +485,7 @@ def main():
             logger.info(" No legacy skype users identified")
 
     if args.teamsStatus:
-        if statusNames:
+        if len(statusNames) != 0:
             if args.outputfile != '':
                 statusOutFile = "Status_" + str(args.outputfile)
                 statusOverwriteFile = True
@@ -475,9 +503,8 @@ def main():
                     with open(statusOutFile, "a+") as statusOut:
                         statusOut.write(titleLine)
                     logger.debug(" Found %i Users with status information, creating file with names" % len(statusNames))
-                    statusNamesUniq = list(dict.fromkeys(statusNames))
                     with open(statusOutFile, "a+") as statusOut:
-                        for statusName in statusNamesUniq:
+                        for statusName in statusNames:
                             statusOut.write(statusName + "\n")
                     statusOut.close()
                 else:
