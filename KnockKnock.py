@@ -63,15 +63,24 @@ MITMPROXY_PORT=8000
 validNames = set()
 legacyNames = set()
 statusNames = set()
+outfile = None
+legOut = None
+statusOut = None
 
 def OneDriveEnumerator(targetTenant, potentialNameOD):
+    global outfile
+    global legOut
+    global statusOut
+    
     try:
         testURL = "https://" + targetTenant + "-my.sharepoint.com/personal/" + str(potentialNameOD.replace(".","_")) + "_" + str(args.targetDomain.replace(".","_")) + "/_layouts/15/onedrive.aspx"
         logger.debug("Testing: " + str(testURL))
         userRequest = requests.get(testURL, verify=False)
         if userRequest.status_code in [200, 401, 403, 302]:
             logger.info(" [+] " + str(str(potentialNameOD) + "@" + str(args.targetDomain)))
-            validNames.add(potentialNameOD.strip().lower())
+            validName = potentialNameOD.strip().lower()
+            validNames.add(validName)
+            outfile.write(validName + "@" + args.targetDomain + "\n")
         else:
             logger.debug(" [-] " + str(str(potentialNameOD) + "@" + str(args.targetDomain)))
             pass
@@ -124,6 +133,10 @@ def getPresence(mri, bearer):
 
 
 def teamsEnum(theToken, potentialUserNameTeams):
+    global outfile
+    global legOut
+    global statusOut
+    
     try:
         logger.debug(" [V] Testing user %s" % potentialUserNameTeams)
 
@@ -137,9 +150,12 @@ def teamsEnum(theToken, potentialUserNameTeams):
         }
 
         initRequest = requests.get(URL_TEAMS + str(potentialUserNameTeams) + "/externalsearchv3?includeTFLUsers=true", headers=initHeaders)
+        potentialUserNameTeamsResult = potentialUserNameTeams.split("@")[0].strip().lower()
         if initRequest.status_code == 403:
             logger.info(" [+] %s" % potentialUserNameTeams.strip().lower())
-            validNames.add(str(potentialUserNameTeams.split("@")[0].strip().lower()))
+            if potentialUserNameTeamsResult not in validNames:
+                validNames.add(potentialUserNameTeamsResult)
+                outfile.write(potentialUserNameTeamsResult + "@" + args.targetDomain + "\n")
 
         elif initRequest.status_code == 404:
             logger.debug(" Error with username - %s" % str(potentialUserNameTeams.strip().lower()))
@@ -150,13 +166,19 @@ def teamsEnum(theToken, potentialUserNameTeams):
             if statusLevel:
                 if "skypeId" in statusLevel[0]:
                     logger.info(" [+] %s -- Legacy Skype Detected" % potentialUserNameTeams)
-                    validNames.add(potentialUserNameTeams.split("@")[0].strip().lower())
-                    legacyNames.add(potentialUserNameTeams.split("@")[0].strip().lower())
+                    if potentialUserNameTeamsResult not in validNames:
+                        validNames.add(potentialUserNameTeamsResult)
+                        outfile.write(potentialUserNameTeamsResult + "@" + args.targetDomain + "\n")
+                    if potentialUserNameTeamsResult not in legacyNames:
+                        legacyNames.add(potentialUserNameTeamsResult)
+                        legOut.write(potentialUserNameTeamsResult + "@" + args.targetDomain + "\n")
                     logger.debug(json.dumps(statusLevel, indent=2))
                 else:
                     if not args.teamsStatus:
                         logger.info(" [+] %s" % potentialUserNameTeams)
-                        validNames.add(str(potentialUserNameTeams.split("@")[0].strip().lower()))
+                        if potentialUserNameTeamsResult not in validNames:
+                            validNames.add(str(potentialUserNameTeamsResult))
+                            outfile.write(potentialUserNameTeamsResult + "@" + args.targetDomain + "\n")
                         logger.debug(json.dumps(statusLevel, indent=2))
 
                 if args.teamsStatus:
@@ -164,11 +186,19 @@ def teamsEnum(theToken, potentialUserNameTeams):
                     availability, device_type, out_of_office_note = getPresence(mriStatus, theToken)
                     if out_of_office_note is None:
                         logger.info(f" [+] %s -- %s -- %s" % (potentialUserNameTeams.strip(), availability, device_type))
-                        statusNames.add(f"{potentialUserNameTeams.strip().lower()} -- {availability} -- {device_type}")
+                        status = f"{potentialUserNameTeams.strip().lower()} -- {availability} -- {device_type}"
+                        if status not in statusNames:
+                            statusNames.add(status)
+                            statusOut.write(status + "\n")
                     if out_of_office_note is not None:
                         logger.info(" [+] %s -- %s -- %s -- %s" % (potentialUserNameTeams.strip().lower(), availability, device_type, repr(out_of_office_note)))
-                        statusNames.add(f"{potentialUserNameTeams.strip().lower()} -- {availability} -- {device_type} -- {repr(out_of_office_note)}")
-                    validNames.add(str(potentialUserNameTeams.split("@")[0].strip().lower()))
+                        status = f"{potentialUserNameTeams.strip().lower()} -- {availability} -- {device_type} -- {repr(out_of_office_note)}"
+                        if status not in statusNames:
+                            statusNames.add(status)
+                            statusOut.write(status + "\n")
+                    if potentialUserNameTeamsResult not in validNames:
+                        validNames.add(potentialUserNameTeamsResult)
+                        outfile.write(potentialUserNameTeamsResult + "@" + args.targetDomain + "\n")
             else:
                 logger.debug(" [-] %s" % potentialUserNameTeams.strip().lower())
 
@@ -311,9 +341,69 @@ def getNumOfLinesInFile(f):
 def main():
     global bar
     global bar2
+    global outfile
+    global legOut
+    global statusOut
 
     if args.teamsStatus:
         logger.info(" Username -- Availability -- Device Type -- Out of Office Note\n")
+
+    #####################
+    ## Setup output files
+    #####################
+    if args.outputfile != '':
+        # Output file
+        overwriteOutputFile = True
+        if Path.exists(Path(args.outputfile)):
+            overwriteOutFileChoice = input(" [!] Output File exists, overwrite? [Y/n] ")
+            if overwriteOutFileChoice == "y" or "Y" or "":
+                overwriteOutputFile = True
+                Path(args.outputfile).unlink(missing_ok=True)
+            else:
+                overwriteOutputFile = False
+        if overwriteOutputFile:
+            outfile = open(args.outputfile, 'w')
+        else:
+            logger.info(" Not overwriting output file")
+
+        # Teams legacy
+        if args.teamsLegacy:
+            legacyOutFile = "Legacy_" + str(args.outputfile)
+            legacyOverwriteFile = True
+            if Path.exists(Path(legacyOutFile)):
+                legOverwriteChoice = input("[!] Legacy Output File exists, overwrite? [Y/n] ")
+                if legOverwriteChoice == "y" or "Y" or "":
+                    legacyOverwriteFile = True
+                    Path(legacyOutFile).unlink(missing_ok=True)
+                else:
+                    legacyOverwriteFile = False
+            if legacyOverwriteFile:
+                legOut = open(legacyOutFile, "w")
+            else:
+                logger.info(" Not overwriting legacy skype users file")
+        else:
+            logger.info(" No legacy skype users identified")
+
+        # Teams status
+        if args.teamsStatus:
+            if args.outputfile != '':
+                statusOutFile = "Status_" + str(args.outputfile)
+                statusOverwriteFile = True
+
+                if Path.exists(Path(statusOutFile)):
+                    statusOverwriteChoice = input(" [!] Status Output File exists, overwrite? [Y/n] ")
+                    if statusOverwriteChoice == "y" or "Y" or "":
+                        statusOverwriteFile = True
+                        Path(statusOutFile).unlink(missing_ok=True)
+                    else:
+                        statusOverwriteFile = False
+
+                if statusOverwriteFile:
+                    titleLine = "Username -- Availability -- Device Type -- Out of Office Note\n"
+                    statusOut = open(statusOutFile, "a+")
+                    statusOut.write(titleLine)
+                else:
+                    logger.info(" Not overwriting status file")
 
     ###########
     ## OneDrive
@@ -439,76 +529,12 @@ def main():
     ####################
     ## Aggregate results
     ####################
-    if len(validNames) != 0:
-        if args.outputfile != '':
-            overwriteOutputFile = True
-            if Path.exists(Path(args.outputfile)):
-                overwriteOutFileChoice = input(" [!] Output File exists, overwrite? [Y/n] ")
-                if overwriteOutFileChoice == "y" or "Y" or "":
-                    overwriteOutputFile = True
-                    Path(args.outputfile).unlink(missing_ok=True)
-                else:
-                    overwriteOutputFile = False
-
-            if overwriteOutputFile:
-                logger.debug(" Running deduplication and writing names to file")
-                with open(args.outputfile, 'w') as outfile:
-                    for item in validNames:
-                        outfile.write(item + "@" + args.targetDomain + "\n")
-                outfile.close()
-            else:
-                logger.info(" Not overwriting output file")
-
-    if args.teamsLegacy:
-        if len(legacyNames) != 0:
-            if args.outputfile != '':
-                legacyOutFile = "Legacy_" + str(args.outputfile)
-                legacyOverwriteFile = True
-
-                if Path.exists(Path(legacyOutFile)):
-                    legOverwriteChoice = input("[!] Legacy Output File exists, overwrite? [Y/n] ")
-                    if legOverwriteChoice == "y" or "Y" or "":
-                        legacyOverwriteFile = True
-                        Path(legacyOutFile).unlink(missing_ok=True)
-                    else:
-                        legacyOverwriteFile = False
-
-                if legacyOverwriteFile:
-                    logger.debug(" Found %i Legacy Skype Users, creating file with names" % len(legacyNames))
-                    with open(legacyOutFile, "w") as legOut:
-                        for legName in legacyNames:
-                            legOut.write(legName + "@" + args.targetDomain + "\n")
-                    legOut.close()
-                else:
-                    logger.info(" Not overwriting legacy skype users file")
-        else:
-            logger.info(" No legacy skype users identified")
-
-    if args.teamsStatus:
-        if len(statusNames) != 0:
-            if args.outputfile != '':
-                statusOutFile = "Status_" + str(args.outputfile)
-                statusOverwriteFile = True
-
-                if Path.exists(Path(statusOutFile)):
-                    statusOverwriteChoice = input(" [!] Status Output File exists, overwrite? [Y/n] ")
-                    if statusOverwriteChoice == "y" or "Y" or "":
-                        statusOverwriteFile = True
-                        Path(statusOutFile).unlink(missing_ok=True)
-                    else:
-                        statusOverwriteFile = False
-
-                if statusOverwriteFile:
-                    titleLine = "Username -- Availability -- Device Type -- Out of Office Note\n"
-                    with open(statusOutFile, "a+") as statusOut:
-                        statusOut.write(titleLine)
-                    logger.debug(" Found %i Users with status information, creating file with names" % len(statusNames))
-                    with open(statusOutFile, "a+") as statusOut:
-                        for statusName in statusNames:
-                            statusOut.write(statusName + "\n")
-                    statusOut.close()
-                else:
-                    logger.info(" Not overwriting status file")
+    if outfile != None:
+        outfile.close()
+    if legOut != None:
+        legOut.close()
+    if statusOut != None:
+        statusOut.close()
 
 if __name__ == "__main__":
     main()
