@@ -432,11 +432,14 @@ def main():
                     while True:
                         while len(batchedFutures) < args.maxThreads:
                             try:
+                                usernameToTry = args.inputList.readline().strip().split("@")[0]
+                                if usernameToTry == "":
+                                    break
                                 batchedFutures.add(
                                     executor.submit(
                                         OneDriveEnumerator,
                                         targetTenant,
-                                        args.inputList.readline().strip().split("@")[0]
+                                        usernameToTry
                                         )
                                 )
                             except:
@@ -502,13 +505,15 @@ def main():
                     while True:
                         while len(batchedFutures) < args.maxThreads:
                             try:
-                                name = args.inputList.readline().strip().split("@")[0]
-                                if name not in validNames: # Skip names that OneDrive enumeration has already found
+                                usernameToTry = args.inputList.readline().strip().split("@")[0]
+                                if usernameToTry == "":
+                                    break
+                                if usernameToTry not in validNames: # Skip names that OneDrive enumeration has already found
                                     batchedFutures.add(
                                         executor.submit(
                                             teamsEnum,
                                             theToken,
-                                            f"{name}@{args.targetDomain}",
+                                            f"{usernameToTry}@{args.targetDomain}",
                                             )
                                     )
                             except:
