@@ -97,19 +97,23 @@ def flushFileBuffersPeriodically():
                 fileToFlush.flush()
 
 async def OneDriveEnumeratorHandlerAsync(usernameToTry, targetTenant, client, bar):
-    logger.debug(" [V] Testing user %s" % usernameToTry)
-                
-    url = "https://" + targetTenant + "-my.sharepoint.com/personal/" + usernameToTry.replace(".","_") + "_" + args.targetDomain.replace(".","_") + "/_layouts/15/onedrive.aspx"
-    userRequest = await client.get(
-        url=url
-    )
-    if userRequest.status_code in [200, 401, 403, 302]:
-        logger.info(" [+] " + usernameToTry + "@" + str(args.targetDomain))
-        validNames.add(usernameToTry)
-        outfile.write(usernameToTry + "@" + args.targetDomain + "\n")
-    else:
-        logger.debug(" [-] " + usernameToTry + "@" + str(args.targetDomain))
-    bar()
+    try:
+        logger.debug(" [V] Testing user %s" % usernameToTry)
+
+        url = "https://" + targetTenant + "-my.sharepoint.com/personal/" + usernameToTry.replace(".","_") + "_" + args.targetDomain.replace(".","_") + "/_layouts/15/onedrive.aspx"
+        userRequest = await client.get(
+            url=url
+        )
+        if userRequest.status_code in [200, 401, 403, 302]:
+            logger.info(" [+] " + usernameToTry + "@" + str(args.targetDomain))
+            validNames.add(usernameToTry)
+            outfile.write(usernameToTry + "@" + args.targetDomain + "\n")
+        else:
+            logger.debug(" [-] " + usernameToTry + "@" + str(args.targetDomain))
+    except httpx.ReadError:
+        pass
+    finally:
+        bar()
 
 async def OneDriveEnumerator(targetTenant, bar):
     global outfile
@@ -202,62 +206,66 @@ async def TeamsGetPresence(mri, bearer):
 async def TeamsEnumeratorHandlerAsync(bar, theToken, client, usernameToTry: str, initHeaders: dict):
     global URL_TEAMS_ENUM
 
-    logger.debug(" [V] Testing user %s" % usernameToTry)
+    try:
+        logger.debug(" [V] Testing user %s" % usernameToTry)
 
-    initRequest = await client.get(
-        url=f"{URL_TEAMS_ENUM}{usernameToTry}@{args.targetDomain}/externalsearch?includeTFLUsers=false",
-        headers=initHeaders
-    )
-    if initRequest.status_code == 403:
-        logger.info(" [+] %s" % usernameToTry)
-        if usernameToTry not in validNames:
-            validNames.add(usernameToTry)
-            outfile.write(usernameToTry + "@" + args.targetDomain + "\n")
-    elif initRequest.status_code == 404:
-        logger.debug(" Error with username - %s" % str(usernameToTry))
-    elif initRequest.status_code == 200:
-        statusLevel = json.loads(initRequest.text)
-        if statusLevel:
-            if "skypeId" in statusLevel[0]:
-                logger.info(" [+] %s -- Legacy Skype Detected" % usernameToTry)
-                if usernameToTry not in validNames:
-                    validNames.add(usernameToTry)
-                    outfile.write(usernameToTry + "@" + args.targetDomain + "\n")
-                if usernameToTry not in legacyNames:
-                    legacyNames.add(usernameToTry)
-                    legOut.write(usernameToTry + "@" + args.targetDomain + "\n")
-                logger.debug(json.dumps(statusLevel, indent=2))
-            else:
-                if not args.teamsStatus:
-                    logger.info(" [+] %s" % usernameToTry)
+        initRequest = await client.get(
+            url=f"{URL_TEAMS_ENUM}{usernameToTry}@{args.targetDomain}/externalsearch?includeTFLUsers=false",
+            headers=initHeaders
+        )
+        if initRequest.status_code == 403:
+            logger.info(" [+] %s" % usernameToTry)
+            if usernameToTry not in validNames:
+                validNames.add(usernameToTry)
+                outfile.write(usernameToTry + "@" + args.targetDomain + "\n")
+        elif initRequest.status_code == 404:
+            logger.debug(" Error with username - %s" % str(usernameToTry))
+        elif initRequest.status_code == 200:
+            statusLevel = json.loads(initRequest.text)
+            if statusLevel:
+                if "skypeId" in statusLevel[0]:
+                    logger.info(" [+] %s -- Legacy Skype Detected" % usernameToTry)
                     if usernameToTry not in validNames:
                         validNames.add(usernameToTry)
                         outfile.write(usernameToTry + "@" + args.targetDomain + "\n")
+                    if usernameToTry not in legacyNames:
+                        legacyNames.add(usernameToTry)
+                        legOut.write(usernameToTry + "@" + args.targetDomain + "\n")
                     logger.debug(json.dumps(statusLevel, indent=2))
-            if args.teamsStatus:
-                mriStatus = statusLevel[0].get("mri")
-                availability, device_type, out_of_office_note = await TeamsGetPresence(mriStatus, theToken)
-                if out_of_office_note is None:
-                    logger.info(f" [+] %s -- %s -- %s" % (usernameToTry, availability, device_type))
-                    status = f"{usernameToTry} -- {availability} -- {device_type}"
-                    if status not in statusNames:
-                        statusNames.add(status)
-                        statusOut.write(status + "\n")
-                if out_of_office_note is not None:
-                    logger.info(" [+] %s -- %s -- %s -- %s" % (usernameToTry, availability, device_type, repr(out_of_office_note)))
-                    status = f"{usernameToTry} -- {availability} -- {device_type} -- {repr(out_of_office_note)}"
-                    if status not in statusNames:
-                        statusNames.add(status)
-                        statusOut.write(status + "\n")
-                if usernameToTry not in validNames:
-                    validNames.add(usernameToTry)
-                    outfile.write(usernameToTry + "@" + args.targetDomain + "\n")
-        else:
-            logger.debug(" [-] %s" % usernameToTry)
-    elif initRequest.status_code == 401:
-        logger.error(" Error with Teams Auth Token... \n\tShutting down threads and Exiting")
-        sys.exit()
-    bar()
+                else:
+                    if not args.teamsStatus:
+                        logger.info(" [+] %s" % usernameToTry)
+                        if usernameToTry not in validNames:
+                            validNames.add(usernameToTry)
+                            outfile.write(usernameToTry + "@" + args.targetDomain + "\n")
+                        logger.debug(json.dumps(statusLevel, indent=2))
+                if args.teamsStatus:
+                    mriStatus = statusLevel[0].get("mri")
+                    availability, device_type, out_of_office_note = await TeamsGetPresence(mriStatus, theToken)
+                    if out_of_office_note is None:
+                        logger.info(f" [+] %s -- %s -- %s" % (usernameToTry, availability, device_type))
+                        status = f"{usernameToTry} -- {availability} -- {device_type}"
+                        if status not in statusNames:
+                            statusNames.add(status)
+                            statusOut.write(status + "\n")
+                    if out_of_office_note is not None:
+                        logger.info(" [+] %s -- %s -- %s -- %s" % (usernameToTry, availability, device_type, repr(out_of_office_note)))
+                        status = f"{usernameToTry} -- {availability} -- {device_type} -- {repr(out_of_office_note)}"
+                        if status not in statusNames:
+                            statusNames.add(status)
+                            statusOut.write(status + "\n")
+                    if usernameToTry not in validNames:
+                        validNames.add(usernameToTry)
+                        outfile.write(usernameToTry + "@" + args.targetDomain + "\n")
+            else:
+                logger.debug(" [-] %s" % usernameToTry)
+        elif initRequest.status_code == 401:
+            logger.error(" Error with Teams Auth Token... \n\tShutting down threads and Exiting")
+            sys.exit()
+    except httpx.ReadError:
+        pass
+    finally:
+        bar()
 
 async def TeamsEnumerator(theToken, bar):
     global outfile
@@ -526,7 +534,7 @@ def main():
             with alive_bar(getNumOfLinesInFile(args.inputList), title="Enumerating Teams Users", enrich_print=False) as bar:
                 with ThreadPoolExecutor(max_workers=args.maxThreads) as threadPoolExecutor:
                     threadPoolExecutor.submit(flushFileBuffersPeriodically)
-                    
+
                     for threadNum in range(0, args.maxThreads):
                         threadPoolExecutor.submit(
                             asyncio.run,
