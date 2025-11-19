@@ -11,7 +11,7 @@ from webdriver_manager.firefox import GeckoDriverManager
 from threading import Thread, Event
 import httpx
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from time import sleep
 from ssh import SSHProxyManager
 import random
@@ -180,8 +180,6 @@ async def OneDriveEnumerator(targetTenant, bar):
                 await taskResult
     except Exception as e:
         logger.error("[V] " + str(e))
-    finally:
-        allDone = True
 
 async def TeamsGetPresence(mri, bearer):
     global URL_PRESENCE_TEAMS
@@ -367,9 +365,6 @@ async def TeamsEnumerator(theToken, bar):
 
     except Exception as e:
         logger.error(" [V] " + str(e))
-        pass
-    finally:
-        allDone = True
 
 def start_mitmproxy(debug, exit_event):
     mitmproxy_script = os.path.join(os.getcwd(), "mitmproxy_addon.py")
@@ -544,57 +539,35 @@ def main():
     #####################
     if args.outputfile != '':
         # Output file
-        overwriteOutputFile = True
         if Path.exists(Path(args.outputfile)):
-            overwriteOutFileChoice = input(" [!] Output File exists, overwrite? [Y/n] ")
-            if overwriteOutFileChoice == "y" or "Y" or "":
-                overwriteOutputFile = True
-                Path(args.outputfile).unlink(missing_ok=True)
-            else:
-                overwriteOutputFile = False
-        if overwriteOutputFile:
-            outfile = open(args.outputfile, 'w')
+            overwriteOutFileChoice = input(" [!] Output File exists, append? [Y/n] ")
+            outfile = open(args.outputfile, "a" if overwriteOutFileChoice in ["y", "Y", ""] else "w")
         else:
-            logger.info(" Not overwriting output file")
+            outfile = open(args.outputfile, "w")
 
         # Teams legacy
         if args.teamsLegacy:
             legacyOutFile = "Legacy_" + str(args.outputfile)
-            legacyOverwriteFile = True
             if Path.exists(Path(legacyOutFile)):
-                legOverwriteChoice = input("[!] Legacy Output File exists, overwrite? [Y/n] ")
-                if legOverwriteChoice == "y" or "Y" or "":
-                    legacyOverwriteFile = True
-                    Path(legacyOutFile).unlink(missing_ok=True)
-                else:
-                    legacyOverwriteFile = False
-            if legacyOverwriteFile:
-                legOut = open(legacyOutFile, "w")
+                legOverwriteChoice = input("[!] Legacy Output File exists, append? [Y/n] ")
+                legOut = open(legacyOutFile, "a" if legOverwriteChoice in ["y", "Y", ""] else "w")
             else:
-                logger.info(" Not overwriting legacy skype users file")
+                legOut = open(args.outputfile, "w")
         else:
-            logger.info(" No legacy skype users identified")
+            logger.info(" No legacy skype users will be identified")
 
         # Teams status
         if args.teamsStatus:
             if args.outputfile != '':
                 statusOutFile = "Status_" + str(args.outputfile)
-                statusOverwriteFile = True
 
                 if Path.exists(Path(statusOutFile)):
-                    statusOverwriteChoice = input(" [!] Status Output File exists, overwrite? [Y/n] ")
-                    if statusOverwriteChoice == "y" or "Y" or "":
-                        statusOverwriteFile = True
-                        Path(statusOutFile).unlink(missing_ok=True)
-                    else:
-                        statusOverwriteFile = False
+                    statusOverwriteChoice = input(" [!] Status Output File exists, append? [Y/n] ")
+                    statusOut = open(statusOutFile, "a" if statusOverwriteChoice in ["y", "Y", ""] else "w")
 
-                if statusOverwriteFile:
-                    titleLine = "Username -- Availability -- Device Type -- Out of Office Note\n"
-                    statusOut = open(statusOutFile, "a+")
-                    statusOut.write(titleLine)
+                    statusOut.write("Username -- Availability -- Device Type -- Out of Office Note\n")
                 else:
-                    logger.info(" Not overwriting status file")
+                    statusOut = open(args.outputfile, "w")
 
     ###########
     ## OneDrive
@@ -618,18 +591,24 @@ def main():
             logger.debug(" [V] Running OneDrive Enumeration")
 
             with alive_bar(getNumOfLinesInFile(args.inputList), title="Enumerating Teams Users", enrich_print=False) as bar:
-                with ThreadPoolExecutor(max_workers=args.maxThreads) as threadPoolExecutor:
+                with ThreadPoolExecutor(max_workers=args.maxThreads + 1) as threadPoolExecutor:
                     allDone = False
+                    tasks = []
+
                     threadPoolExecutor.submit(flushFileBuffersPeriodically)
 
                     for threadNum in range(0, args.maxThreads):
-                        threadPoolExecutor.submit(
+                        tasks.append(
+                            threadPoolExecutor.submit(
                             asyncio.run,
                             OneDriveEnumerator(
                                 targetTenant,
                                 bar
+                                )
                             )
                         )
+                    wait(tasks)
+                    allDone = True
 
         except Exception as e:
             logger.error(" Error running OneDrive Enumeration")
@@ -684,19 +663,25 @@ def main():
             args.inputList.seek(0)
             
             with alive_bar(getNumOfLinesInFile(args.inputList), title="Enumerating Teams Users", enrich_print=False) as bar2:
-                with ThreadPoolExecutor(max_workers=args.maxThreads) as threadPoolExecutor:
-                    allDone = False
-                    threadPoolExecutor.submit(flushFileBuffersPeriodically)
+                    with ThreadPoolExecutor(max_workers=args.maxThreads + 1) as threadPoolExecutor:
+                        allDone = False
+                        tasks = []
 
-                    for threadNum in range(0, args.maxThreads):
-                        threadPoolExecutor.submit(
-                            asyncio.run,
-                            TeamsEnumerator(
-                                theToken,
-                                bar2
+                        threadPoolExecutor.submit(flushFileBuffersPeriodically)
+
+                        for threadNum in range(0, args.maxThreads):
+                            tasks.append(
+                                    threadPoolExecutor.submit(
+                                    asyncio.run,
+                                    TeamsEnumerator(
+                                        theToken,
+                                        bar2
+                                    )
+                                )
                             )
-                        )
-
+                        wait(tasks)
+                        allDone = True
+                    
         except Exception as e:
             logger.error(" Error running Teams Enumeration")
             logger.error(" " + str(e))
