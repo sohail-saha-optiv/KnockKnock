@@ -13,6 +13,8 @@ import httpx
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from time import sleep
+from ssh import SSHProxyManager
+import random
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -35,6 +37,8 @@ parser.add_argument('-i', dest='inputList', type=argparse.FileType('r'), require
 parser.add_argument('-o', dest='outputfile', type=str, required=False, default='', help="Write output to file")
 parser.add_argument('-d', dest='targetDomain', type=str, required=True, default='', help="Domain to target")
 parser.add_argument('-t', dest='teamsToken', required=False, default='', help="Teams Token, either file, string, or 'proxy' for interactive Firefox")
+parser.add_argument('--ssh', dest='sshLogins', required=False, nargs="*", default="", help="SSH proxies to use; format: 'USER1@IP1 USER2@IP2 ...'")
+parser.add_argument('--sshKey', dest='sshLoginsKey', type=str, required=False, default="", help="Private SSH keyfile for SSH proxies")
 parser.add_argument('--threads', dest='maxThreads', required=False, type=int, default=3, help="Number of threads to use in the Teams User Enumeration (default = 3)")
 parser.add_argument('--timeout', dest='timeout', required=False, type=int, default=None, help="Timeout (secs) for each web request (default = none)")
 parser.add_argument('--max-connections-thread', dest='max_connections_thread', required=False, type=int, default=100, help="Maximum connections per thread (default = 100)")
@@ -71,6 +75,7 @@ URL_TEAMS_ENUM = "https://teams.microsoft.com/api/mt/emea/beta/users/"
 CLIENT_VERSION_TEAMS = "27/1.0.0.2021011237"
 URL_PRESENCE_TEAMS = "https://presence.teams.microsoft.com/v1/presence/getpresence/"
 
+sshProxyManager: SSHProxyManager = None
 validNames = set()
 legacyNames = set()
 statusNames = set()
@@ -78,6 +83,7 @@ outfile = None
 legOut = None
 statusOut = None
 allDone = False
+httpxAsyncClients: list[httpx.AsyncClient] = []
 
 # Periodically flushes all files; done to get partial results even if script throws errors and exits
 def flushFileBuffersPeriodically():
@@ -127,37 +133,31 @@ async def OneDriveEnumerator(targetTenant, bar):
     global legOut
     global statusOut
     global allDone
+    global httpxAsyncClients
     
     try:
-        limits = httpx.Limits(max_connections=args.max_connections_thread, max_keepalive_connections=args.max_connections_thread)
-        timeout = httpx.Timeout(connect=args.timeout, read=args.timeout, write=args.timeout, pool=None)
-        async with httpx.AsyncClient(verify=False, timeout=timeout, limits=limits) as client:
-            while True:
-                tasks = []
-                usernamesToTry = [args.inputList.readline().strip().split("@")[0].lower() for _ in range(0, USERNAMES_BATCHSIZE)]
-
-                if len(usernamesToTry) == 0:
-                    break
-
-                for usernameToTry in usernamesToTry:
-                    if usernameToTry == "":
-                        continue
-
-                    if usernameToTry in validNames: # Skip names that OneDrive enumeration has already found
-                        bar()
-                        continue
-
-                    tasks.append(
-                        OneDriveEnumeratorHandlerAsync(
-                            usernameToTry=usernameToTry,
-                            targetTenant=targetTenant,
-                            client=client,
-                            bar=bar
-                            )
-                    )
-                
-                for taskResult in asyncio.as_completed(tasks):
-                    await taskResult
+        while True:
+            tasks = []
+            usernamesToTry = [args.inputList.readline().strip().split("@")[0].lower() for _ in range(0, USERNAMES_BATCHSIZE)]
+            if len(usernamesToTry) == 0:
+                break
+            for usernameToTry in usernamesToTry:
+                if usernameToTry == "":
+                    continue
+                if usernameToTry in validNames: # Skip names that OneDrive enumeration has already found
+                    bar()
+                    continue
+                tasks.append(
+                    OneDriveEnumeratorHandlerAsync(
+                        usernameToTry=usernameToTry,
+                        targetTenant=targetTenant,
+                        client=random.choice(httpxAsyncClients),
+                        bar=bar
+                        )
+                )
+            
+            for taskResult in asyncio.as_completed(tasks):
+                await taskResult
 
     except httpx.ConnectError as e:
         logger.error("Failed to connect to Tenant's OneDrive; most probably it does not exist")
@@ -169,6 +169,7 @@ async def OneDriveEnumerator(targetTenant, bar):
 
 async def TeamsGetPresence(mri, bearer):
     global URL_PRESENCE_TEAMS
+    global sshProxyManager
 
     initHeaders = {
         "x-ms-client-version": "CLIENT_VERSION",
@@ -181,7 +182,7 @@ async def TeamsGetPresence(mri, bearer):
     try:
         limits = httpx.Limits(max_connections=args.max_connections_thread, max_keepalive_connections=args.max_connections_thread)
         timeout = httpx.Timeout(connect=args.timeout, read=args.timeout, write=args.timeout, pool=None)
-        async with httpx.AsyncClient(verify=False, timeout=timeout, limits=limits) as client:
+        async with httpx.AsyncClient(verify=False, timeout=timeout, limits=limits, proxy=sshProxyManager.get_random_proxy()) as client:
             response = client.post(URL_PRESENCE_TEAMS, data=json_data, headers=initHeaders)
             response.raise_for_status()
     except Exception as e:
@@ -284,48 +285,51 @@ async def TeamsEnumerator(theToken, bar):
     global validNames
     global USERNAMES_BATCHSIZE
     global allDone
+    global sshProxyManager
+    global httpxAsyncClients
     
     try:
-        limits = httpx.Limits(max_connections=args.max_connections_thread, max_keepalive_connections=args.max_connections_thread)
-        timeout = httpx.Timeout(connect=args.timeout, read=None, write=None, pool=None)
-        async with httpx.AsyncClient(verify=False, timeout=timeout, limits=limits) as client:
-            initHeaders = {
-                "Host": "teams.microsoft.com",
-                "Authorization": "Bearer " + theToken.strip(),
-                "X-Ms-Client-Version": CLIENT_VERSION_TEAMS,
-            }
-            while True:
-                tasks = []
-                usernamesToTry = []
-                for _ in range(0, USERNAMES_BATCHSIZE):
-                    usernameToTry = args.inputList.readline().strip().split("@")[0].lower()
-                    if usernameToTry == "":
-                        break
-                    usernamesToTry.append(usernameToTry)
-                
-                if len(usernamesToTry) == 0:
+        initHeaders = {
+            "Host": "teams.microsoft.com",
+            "Authorization": "Bearer " + theToken.strip(),
+            "X-Ms-Client-Version": CLIENT_VERSION_TEAMS,
+        }
+        if args.teamsStatus:
+            logger.info(" Username -- Availability -- Device Type -- Out of Office Note\n")
+        
+        while True:
+            tasks = []
+            usernamesToTry = []
+
+            for _ in range(0, USERNAMES_BATCHSIZE):
+                usernameToTry = args.inputList.readline().strip().split("@")[0].lower()
+                if usernameToTry == "":
                     break
+                usernamesToTry.append(usernameToTry)
+            
+            if len(usernamesToTry) == 0:
+                break
 
-                for usernameToTry in usernamesToTry:
-                    if usernameToTry == "":
-                        continue
+            for usernameToTry in usernamesToTry:
+                if usernameToTry == "":
+                    continue
 
-                    if usernameToTry in validNames: # Skip names that OneDrive enumeration has already found
-                        bar()
-                        continue
+                if usernameToTry in validNames: # Skip names that OneDrive enumeration has already found
+                    bar()
+                    continue
 
-                    tasks.append(
-                        TeamsEnumeratorHandlerAsync(
-                            bar=bar,
-                            theToken=theToken,
-                            client=client,
-                            usernameToTry=usernameToTry,
-                            initHeaders=initHeaders
-                        )
+                tasks.append(
+                    TeamsEnumeratorHandlerAsync(
+                        bar=bar,
+                        theToken=theToken,
+                        client=random.choice(httpxAsyncClients),
+                        usernameToTry=usernameToTry,
+                        initHeaders=initHeaders
                     )
+                )
 
-                for taskResult in asyncio.as_completed(tasks):
-                    await taskResult
+            for taskResult in asyncio.as_completed(tasks):
+                await taskResult
 
     except Exception as e:
         logger.error(" [V] " + str(e))
@@ -402,7 +406,9 @@ def start_firefox(options):
     return driver
 
 def OneDriveGetTenantName(target_domain):
-    client = httpx.Client()
+    global httpxAsyncClients
+
+    client = httpx.Client(proxy=random.choice(httpxAsyncClients))
     logger.debug(" [V] Method 1: SharePoint Discovery...")
     try:
         sharepoint_url = f"https://{target_domain.split('.')[0]}-my.sharepoint.com"
@@ -456,7 +462,9 @@ def OneDriveGetTenantName(target_domain):
 
 def getNumOfLinesInFile(f):
     numOfLines = 0
-    for _ in f:
+    for line in f:
+        if line.strip() == "":
+            continue
         numOfLines += 1
     f.seek(0)
     return numOfLines
@@ -468,9 +476,39 @@ def main():
     global legOut
     global statusOut
     global allDone
+    global sshProxyManager
+    global httpxAsyncClients
 
-    if args.teamsStatus:
-        logger.info(" Username -- Availability -- Device Type -- Out of Office Note\n")
+    ##############################
+    ## Setup SSH proxies if needed
+    ##############################
+    if len(args.sshLogins) != 0:
+        ssh_configs = [
+            {
+                "username": sshLogin.split("@")[0],
+                "private_key_path": args.sshLoginsKey,
+                "ip": sshLogin.split("@")[1]
+            } for sshLogin in args.sshLogins
+        ]
+
+        sshProxyManager = SSHProxyManager(ssh_configs=ssh_configs)
+        sshProxyManager.start_tunnels()
+        sshProxyManager.test_tunnels()
+
+    ######################
+    ## Setup HTTPX Clients
+    ######################
+    limits = httpx.Limits(max_connections=args.max_connections_thread, max_keepalive_connections=args.max_connections_thread)
+    timeout = httpx.Timeout(connect=args.timeout, read=None, write=None, pool=None)
+    if sshProxyManager is None:
+        httpxAsyncClients.append(
+                httpx.AsyncClient(verify=False, timeout=timeout, limits=limits)
+            )
+    else:
+        for proxy in sshProxyManager.proxies:
+            httpxAsyncClients.append(
+                httpx.AsyncClient(verify=False, timeout=timeout, limits=limits, proxy=proxy)
+            )
 
     #####################
     ## Setup output files
@@ -638,6 +676,12 @@ def main():
     ## Stop results output thread
     #############################
     allDone = True
+
+    ###################
+    ## Stop SSH proxies
+    ###################
+    if sshProxyManager is not None:
+        sshProxyManager.stop_tunnels()
 
 if __name__ == "__main__":
     main()
