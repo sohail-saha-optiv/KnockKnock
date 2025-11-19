@@ -87,7 +87,7 @@ def flushFileBuffersPeriodically():
     global allDone
 
     while not allDone:
-        sleep(60)
+        sleep(10)
         for fileToFlush in [
             outfile,
             legOut,
@@ -95,6 +95,13 @@ def flushFileBuffersPeriodically():
         ]:
             if fileToFlush is not None:
                 fileToFlush.flush()
+    for fileToFlush in [
+            outfile,
+            legOut,
+            statusOut
+        ]:
+            if fileToFlush is not None:
+                fileToFlush.close()
 
 async def OneDriveEnumeratorHandlerAsync(usernameToTry, targetTenant, client, bar):
     try:
@@ -119,6 +126,7 @@ async def OneDriveEnumerator(targetTenant, bar):
     global outfile
     global legOut
     global statusOut
+    global allDone
     
     try:
         limits = httpx.Limits(max_connections=args.max_connections_thread, max_keepalive_connections=args.max_connections_thread)
@@ -156,6 +164,8 @@ async def OneDriveEnumerator(targetTenant, bar):
         logger.debug("[V] " + str(e))
     except Exception as e:
         logger.error("[V] " + str(e))
+    finally:
+        allDone = True
 
 async def TeamsGetPresence(mri, bearer):
     global URL_PRESENCE_TEAMS
@@ -273,6 +283,7 @@ async def TeamsEnumerator(theToken, bar):
     global statusOut
     global validNames
     global USERNAMES_BATCHSIZE
+    global allDone
     
     try:
         limits = httpx.Limits(max_connections=args.max_connections_thread, max_keepalive_connections=args.max_connections_thread)
@@ -285,7 +296,12 @@ async def TeamsEnumerator(theToken, bar):
             }
             while True:
                 tasks = []
-                usernamesToTry = [args.inputList.readline().strip().split("@")[0].lower() for _ in range(0, USERNAMES_BATCHSIZE)]
+                usernamesToTry = []
+                for _ in range(0, USERNAMES_BATCHSIZE):
+                    usernameToTry = args.inputList.readline().strip().split("@")[0].lower()
+                    if usernameToTry == "":
+                        break
+                    usernamesToTry.append(usernameToTry)
                 
                 if len(usernamesToTry) == 0:
                     break
@@ -310,10 +326,12 @@ async def TeamsEnumerator(theToken, bar):
 
                 for taskResult in asyncio.as_completed(tasks):
                     await taskResult
-        
+
     except Exception as e:
         logger.error(" [V] " + str(e))
-        pass      
+        pass
+    finally:
+        allDone = True
 
 def start_mitmproxy(debug, exit_event):
     mitmproxy_script = os.path.join(os.getcwd(), "mitmproxy_addon.py")
@@ -449,6 +467,7 @@ def main():
     global outfile
     global legOut
     global statusOut
+    global allDone
 
     if args.teamsStatus:
         logger.info(" Username -- Availability -- Device Type -- Out of Office Note\n")
@@ -533,6 +552,7 @@ def main():
 
             with alive_bar(getNumOfLinesInFile(args.inputList), title="Enumerating Teams Users", enrich_print=False) as bar:
                 with ThreadPoolExecutor(max_workers=args.maxThreads) as threadPoolExecutor:
+                    allDone = False
                     threadPoolExecutor.submit(flushFileBuffersPeriodically)
 
                     for threadNum in range(0, args.maxThreads):
@@ -598,6 +618,7 @@ def main():
             
             with alive_bar(getNumOfLinesInFile(args.inputList), title="Enumerating Teams Users", enrich_print=False) as bar2:
                 with ThreadPoolExecutor(max_workers=args.maxThreads) as threadPoolExecutor:
+                    allDone = False
                     threadPoolExecutor.submit(flushFileBuffersPeriodically)
 
                     for threadNum in range(0, args.maxThreads):
@@ -613,15 +634,10 @@ def main():
             logger.error(" Error running Teams Enumeration")
             logger.error(" " + str(e))
 
-    ####################
-    ## Aggregate results
-    ####################
-    if outfile != None:
-        outfile.close()
-    if legOut != None:
-        legOut.close()
-    if statusOut != None:
-        statusOut.close()
+    #############################
+    ## Stop results output thread
+    #############################
+    allDone = True
 
 if __name__ == "__main__":
     main()
