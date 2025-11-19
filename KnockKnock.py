@@ -11,6 +11,7 @@ from webdriver_manager.firefox import GeckoDriverManager
 from threading import Thread, Event
 import httpx
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -33,8 +34,8 @@ parser.add_argument('-i', dest='inputList', type=argparse.FileType('r'), require
 parser.add_argument('-o', dest='outputfile', type=str, required=False, default='', help="Write output to file")
 parser.add_argument('-d', dest='targetDomain', type=str, required=True, default='', help="Domain to target")
 parser.add_argument('-t', dest='teamsToken', required=False, default='', help="Teams Token, either file, string, or 'proxy' for interactive Firefox")
-#parser.add_argument('--threads', dest='maxThreads', required=False, type=int, default=10, help="Number of threads to use in the Teams User Enumeration (default = 10)") TODO
-parser.add_argument('--timeout', dest='timeout', required=False, type=int, default=None, help="Timeout for each web request (default = none)")
+parser.add_argument('--threads', dest='maxThreads', required=False, type=int, default=3, help="Number of threads to use in the Teams User Enumeration (default = 3)")
+parser.add_argument('--timeout', dest='timeout', required=False, type=int, default=None, help="Timeout (secs) for each web request (default = none)")
 parser.add_argument('--max-connections-thread', dest='max_connections_thread', required=False, type=int, default=100, help="Maximum connections per thread (default = 100)")
 parser.add_argument('-v', dest='verboseMode', required=False, default=False, help="Show verbose output", action="store_true")
 args = parser.parse_args()
@@ -76,13 +77,12 @@ outfile = None
 legOut = None
 statusOut = None
 
-async def oneDriveEnumeratorHandlerAsync(usernameToTry, targetTenant, client, bar):
+async def OneDriveEnumeratorHandlerAsync(usernameToTry, targetTenant, client, bar):
     logger.debug(" [V] Testing user %s" % usernameToTry)
                 
     url = "https://" + targetTenant + "-my.sharepoint.com/personal/" + usernameToTry.replace(".","_") + "_" + args.targetDomain.replace(".","_") + "/_layouts/15/onedrive.aspx"
     userRequest = await client.get(
-        url=url,
-        timeout=10
+        url=url
     )
     if userRequest.status_code in [200, 401, 403, 302]:
         logger.info(" [+] " + usernameToTry + "@" + str(args.targetDomain))
@@ -117,7 +117,7 @@ async def OneDriveEnumerator(targetTenant, bar):
                         continue
 
                     tasks.append(
-                        oneDriveEnumeratorHandlerAsync(
+                        OneDriveEnumeratorHandlerAsync(
                             usernameToTry=usernameToTry,
                             targetTenant=targetTenant,
                             client=client,
@@ -134,7 +134,7 @@ async def OneDriveEnumerator(targetTenant, bar):
     except Exception as e:
         logger.error("[V] " + str(e))
 
-async def getPresence(mri, bearer):
+async def TeamsGetPresence(mri, bearer):
     global URL_PRESENCE_TEAMS
 
     initHeaders = {
@@ -180,15 +180,14 @@ async def getPresence(mri, bearer):
         return None, None, None
 
 
-async def teamsEnumeratorHandlerAsync(bar, theToken, client, usernameToTry: str, initHeaders: dict):
+async def TeamsEnumeratorHandlerAsync(bar, theToken, client, usernameToTry: str, initHeaders: dict):
     global URL_TEAMS_ENUM
 
     logger.debug(" [V] Testing user %s" % usernameToTry)
 
     initRequest = await client.get(
         url=f"{URL_TEAMS_ENUM}{usernameToTry}@{args.targetDomain}/externalsearch?includeTFLUsers=false",
-        headers=initHeaders,
-        timeout=10
+        headers=initHeaders
     )
     if initRequest.status_code == 403:
         logger.info(" [+] %s" % usernameToTry)
@@ -218,7 +217,7 @@ async def teamsEnumeratorHandlerAsync(bar, theToken, client, usernameToTry: str,
                     logger.debug(json.dumps(statusLevel, indent=2))
             if args.teamsStatus:
                 mriStatus = statusLevel[0].get("mri")
-                availability, device_type, out_of_office_note = await getPresence(mriStatus, theToken)
+                availability, device_type, out_of_office_note = await TeamsGetPresence(mriStatus, theToken)
                 if out_of_office_note is None:
                     logger.info(f" [+] %s -- %s -- %s" % (usernameToTry, availability, device_type))
                     status = f"{usernameToTry} -- {availability} -- {device_type}"
@@ -250,7 +249,7 @@ async def TeamsEnumerator(theToken, bar):
     
     try:
         limits = httpx.Limits(max_connections=args.max_connections_thread, max_keepalive_connections=args.max_connections_thread)
-        timeout = httpx.Timeout(connect=args.timeout, read=args.timeout, write=args.timeout, pool=None)
+        timeout = httpx.Timeout(connect=args.timeout, read=None, write=None, pool=None)
         async with httpx.AsyncClient(verify=False, timeout=timeout, limits=limits) as client:
             initHeaders = {
                 "Host": "teams.microsoft.com",
@@ -273,7 +272,7 @@ async def TeamsEnumerator(theToken, bar):
                         continue
 
                     tasks.append(
-                        teamsEnumeratorHandlerAsync(
+                        TeamsEnumeratorHandlerAsync(
                             bar=bar,
                             theToken=theToken,
                             client=client,
@@ -357,7 +356,7 @@ def start_firefox(options):
     driver = webdriver.Firefox(service=service, options=options)
     return driver
 
-def get_tenant_name(target_domain):
+def OneDriveGetTenantName(target_domain):
     client = httpx.Client()
     logger.debug(" [V] Method 1: SharePoint Discovery...")
     try:
@@ -393,7 +392,7 @@ def get_tenant_name(target_domain):
         logger.debug(f" [V] Testing pattern {i+1}: {pattern}")
         try:
             test_url = f"https://{pattern}-my.sharepoint.com"
-            test_response = client.get(test_url, timeout=5, allow_redirects=False, verify=False)
+            test_response = client.get(test_url, timeout=args.timeout, allow_redirects=False, verify=False)
 
             if test_response.status_code in [302, 200, 401, 403]:
                 logger.debug(f" [V] SUCCESS: Found working tenant pattern: {pattern} (HTTP {test_response.status_code})")
@@ -417,7 +416,7 @@ def getNumOfLinesInFile(f):
     f.seek(0)
     return numOfLines
 
-async def main():
+def main():
     global bar
     global bar2
     global outfile
@@ -493,7 +492,7 @@ async def main():
 
             try:
                 logger.debug(" [V] Discovering tenant for target domain")
-                targetTenant = get_tenant_name(args.targetDomain)
+                targetTenant = OneDriveGetTenantName(args.targetDomain)
                 if not targetTenant:
                     logger.error(" Error retrieving tenant for target, Exiting...")
                     sys.exit()
@@ -506,10 +505,15 @@ async def main():
             logger.debug(" [V] Running OneDrive Enumeration")
 
             with alive_bar(getNumOfLinesInFile(args.inputList), title="Enumerating Teams Users", enrich_print=False) as bar:
-                await OneDriveEnumerator(
-                    targetTenant,
-                    bar
-                )
+                with ThreadPoolExecutor(max_workers=args.maxThreads) as threadPoolExecutor:
+                    for threadNum in range(0, args.maxThreads):
+                        threadPoolExecutor.submit(
+                            asyncio.run,
+                            OneDriveEnumerator(
+                                targetTenant,
+                                bar
+                            )
+                        )
 
         except Exception as e:
             logger.error(" Error running OneDrive Enumeration")
@@ -564,10 +568,15 @@ async def main():
             args.inputList.seek(0)
             
             with alive_bar(getNumOfLinesInFile(args.inputList), title="Enumerating Teams Users", enrich_print=False) as bar2:
-                await TeamsEnumerator(
-                    theToken,
-                    bar2
-                )
+                with ThreadPoolExecutor(max_workers=args.maxThreads) as threadPoolExecutor:
+                    for threadNum in range(0, args.maxThreads):
+                        threadPoolExecutor.submit(
+                            asyncio.run,
+                            TeamsEnumerator(
+                                theToken,
+                                bar2
+                            )
+                        )
 
         except Exception as e:
             logger.error(" Error running Teams Enumeration")
@@ -584,4 +593,4 @@ async def main():
         statusOut.close()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
