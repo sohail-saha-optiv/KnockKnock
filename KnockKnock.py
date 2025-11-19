@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-import os,re,sys,json,time,logging,contextlib,subprocess,argparse,urllib3,requests
+import os,re,sys,json,time,logging,contextlib,subprocess,argparse,urllib3
 from pathlib import Path
 from alive_progress import alive_bar
 from argparse import RawTextHelpFormatter
@@ -34,11 +34,15 @@ parser.add_argument('-o', dest='outputfile', type=str, required=False, default='
 parser.add_argument('-d', dest='targetDomain', type=str, required=True, default='', help="Domain to target")
 parser.add_argument('-t', dest='teamsToken', required=False, default='', help="Teams Token, either file, string, or 'proxy' for interactive Firefox")
 #parser.add_argument('--threads', dest='maxThreads', required=False, type=int, default=10, help="Number of threads to use in the Teams User Enumeration (default = 10)") TODO
-parser.add_argument('-v', dest='verboseMode', required=False, default=False, help="Show verbose errors", action="store_true")
+parser.add_argument('--timeout', dest='timeout', required=False, type=int, default=None, help="Timeout for each web request (default = none)")
+parser.add_argument('--max-connections-thread', dest='max_connections_thread', required=False, type=int, default=100, help="Maximum connections per thread (default = 100)")
+parser.add_argument('-v', dest='verboseMode', required=False, default=False, help="Show verbose output", action="store_true")
 args = parser.parse_args()
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+logging.getLogger("httpx").setLevel(logging.ERROR)
+logging.getLogger("httpcore").setLevel(logging.ERROR)
 
 if args.verboseMode:
 	logger.setLevel(logging.DEBUG)
@@ -60,6 +64,10 @@ if args.teamsStatus and args.outputfile == '':
     sys.exit()
 
 MITMPROXY_PORT=8000
+USERNAMES_BATCHSIZE = 1000
+URL_TEAMS_ENUM = "https://teams.microsoft.com/api/mt/emea/beta/users/"
+CLIENT_VERSION_TEAMS = "27/1.0.0.2021011237"
+URL_PRESENCE_TEAMS = "https://presence.teams.microsoft.com/v1/presence/getpresence/"
 
 validNames = set()
 legacyNames = set()
@@ -68,37 +76,21 @@ outfile = None
 legOut = None
 statusOut = None
 
-
-from typing import List, Dict, Any, Optional
-
-async def sendRequest(
-    url: str,
-    method: str,
-    ignore_tls: bool = False,
-    headers: Optional[Dict[str, str]] = None,
-    json_payload: Optional[Dict[str, Any]] = None,
-    timeoutSecs: int = 10
-):
-    async with httpx.AsyncClient(verify=not ignore_tls, timeout=timeoutSecs) as client:
-        try:
-            response = await client.request(
-                method=method.upper(),
-                url=url,
-                headers=headers,
-                json=json_payload # Use `json=` for JSON payloads
-            )
-            # Raise an exception for bad status codes (4xx or 5xx)
-            response.raise_for_status()
-            print(f"  -> SUCCESS: Received status code {response.status_code}")
-            # You can process the response further here, e.g.:
-            # print(f"  -> Response JSON: {response.json()}")
-        except httpx.HTTPStatusError as exc:
-            print(f"  -> ERROR: HTTP Error for {exc.request.url} - "
-                  f"Status code: {exc.response.status_code}")
-        except httpx.RequestError as exc:
-            print(f"  -> ERROR: An error occurred while requesting {exc.request.url}: {exc}")
-        except Exception as exc:
-            print(f"  -> ERROR: An unexpected error occurred: {exc}")
+async def oneDriveEnumeratorHandlerAsync(usernameToTry, targetTenant, client, bar):
+    logger.debug(" [V] Testing user %s" % usernameToTry)
+                
+    url = "https://" + targetTenant + "-my.sharepoint.com/personal/" + usernameToTry.replace(".","_") + "_" + args.targetDomain.replace(".","_") + "/_layouts/15/onedrive.aspx"
+    userRequest = await client.get(
+        url=url,
+        timeout=10
+    )
+    if userRequest.status_code in [200, 401, 403, 302]:
+        logger.info(" [+] " + usernameToTry + "@" + str(args.targetDomain))
+        validNames.add(usernameToTry)
+        outfile.write(usernameToTry + "@" + args.targetDomain + "\n")
+    else:
+        logger.debug(" [-] " + usernameToTry + "@" + str(args.targetDomain))
+    bar()
 
 async def OneDriveEnumerator(targetTenant, bar):
     global outfile
@@ -106,36 +98,44 @@ async def OneDriveEnumerator(targetTenant, bar):
     global statusOut
     
     try:
-        async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
+        limits = httpx.Limits(max_connections=args.max_connections_thread, max_keepalive_connections=args.max_connections_thread)
+        timeout = httpx.Timeout(connect=args.timeout, read=args.timeout, write=args.timeout, pool=None)
+        async with httpx.AsyncClient(verify=False, timeout=timeout, limits=limits) as client:
             while True:
-                usernameToTry = args.inputList.readline().strip().split("@")[0].lower()
-                if usernameToTry == "":
-                    break
-                
-                if usernameToTry in validNames: # Skip names that OneDrive enumeration has already found
-                    bar()
-                    continue
-                
-                logger.debug(" [V] Testing user %s" % usernameToTry)
-                
-                url = "https://" + targetTenant + "-my.sharepoint.com/personal/" + usernameToTry.replace(".","_") + "_" + args.targetDomain.replace(".","_") + "/_layouts/15/onedrive.aspx"
-                userRequest = await client.get(
-                    url=url,
-                    timeout=10
-                )
-                if userRequest.status_code in [200, 401, 403, 302]:
-                    logger.info(" [+] " + usernameToTry + "@" + str(args.targetDomain))
-                    validNames.add(usernameToTry)
-                    outfile.write(usernameToTry + "@" + args.targetDomain + "\n")
-                else:
-                    logger.debug(" [-] " + usernameToTry + "@" + str(args.targetDomain))
-                bar()
+                tasks = []
+                usernamesToTry = [args.inputList.readline().strip().split("@")[0].lower() for _ in range(0, USERNAMES_BATCHSIZE)]
 
-    except Exception as e:
+                if len(usernamesToTry) == 0:
+                    break
+
+                for usernameToTry in usernamesToTry:
+                    if usernameToTry == "":
+                        continue
+
+                    if usernameToTry in validNames: # Skip names that OneDrive enumeration has already found
+                        bar()
+                        continue
+
+                    tasks.append(
+                        oneDriveEnumeratorHandlerAsync(
+                            usernameToTry=usernameToTry,
+                            targetTenant=targetTenant,
+                            client=client,
+                            bar=bar
+                            )
+                    )
+                
+                for taskResult in asyncio.as_completed(tasks):
+                    await taskResult
+
+    except httpx.ConnectError as e:
+        logger.error("Failed to connect to Tenant's OneDrive; most probably it does not exist")
         logger.debug("[V] " + str(e))
+    except Exception as e:
+        logger.error("[V] " + str(e))
 
 async def getPresence(mri, bearer):
-    URL_PRESENCE_TEAMS = "https://presence.teams.microsoft.com/v1/presence/getpresence/"
+    global URL_PRESENCE_TEAMS
 
     initHeaders = {
         "x-ms-client-version": "CLIENT_VERSION",
@@ -146,11 +146,13 @@ async def getPresence(mri, bearer):
     json_data = json.dumps([{"mri": mri}])
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
+        limits = httpx.Limits(max_connections=args.max_connections_thread, max_keepalive_connections=args.max_connections_thread)
+        timeout = httpx.Timeout(connect=args.timeout, read=args.timeout, write=args.timeout, pool=None)
+        async with httpx.AsyncClient(verify=False, timeout=timeout, limits=limits) as client:
             response = client.post(URL_PRESENCE_TEAMS, data=json_data, headers=initHeaders)
             response.raise_for_status()
     except Exception as e:
-        logger.debug(f"Error on response. [ERROR] - {e}")
+        logger.error(f"Error on response. [ERROR] - {e}")
         return None, None, None
 
     try:
@@ -174,94 +176,117 @@ async def getPresence(mri, bearer):
         return availability, device_type, out_of_office_note
     
     except (json.JSONDecodeError, KeyError, IndexError) as e:
-        logger.debug(f"Error parsing response JSON [ERROR] - {e}")
+        logger.error(f"Error parsing response JSON [ERROR] - {e}")
         return None, None, None
 
 
-async def teamsEnum(theToken, bar):
-    global outfile
-    global legOut
-    global statusOut
-    global validNames
-    
-    try:
-        async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
-            URL_TEAMS = "https://teams.microsoft.com/api/mt/emea/beta/users/"
-            CLIENT_VERSION = "27/1.0.0.2021011237"
+async def teamsEnumeratorHandlerAsync(bar, theToken, client, usernameToTry: str, initHeaders: dict):
+    global URL_TEAMS_ENUM
 
-            initHeaders = {
-                "Host": "teams.microsoft.com",
-                "Authorization": "Bearer " + theToken.strip(),
-                "X-Ms-Client-Version": CLIENT_VERSION,
-            }
-            while True:
-                usernameToTry = args.inputList.readline().strip().split("@")[0].lower()
-                if usernameToTry == "":
-                    break
-                
-                if usernameToTry in validNames: # Skip names that OneDrive enumeration has already found
-                    bar()
-                    continue
-                
-                logger.debug(" [V] Testing user %s" % usernameToTry)
-                initRequest = await client.get(
-                    url=f"{URL_TEAMS}{usernameToTry}@{args.targetDomain}/externalsearchv3?includeTFLUsers=true",
-                    headers=initHeaders,
-                    timeout=10
-                )
-                if initRequest.status_code == 403:
+    logger.debug(" [V] Testing user %s" % usernameToTry)
+
+    initRequest = await client.get(
+        url=f"{URL_TEAMS_ENUM}{usernameToTry}@{args.targetDomain}/externalsearch?includeTFLUsers=false",
+        headers=initHeaders,
+        timeout=10
+    )
+    if initRequest.status_code == 403:
+        logger.info(" [+] %s" % usernameToTry)
+        if usernameToTry not in validNames:
+            validNames.add(usernameToTry)
+            outfile.write(usernameToTry + "@" + args.targetDomain + "\n")
+    elif initRequest.status_code == 404:
+        logger.debug(" Error with username - %s" % str(usernameToTry))
+    elif initRequest.status_code == 200:
+        statusLevel = json.loads(initRequest.text)
+        if statusLevel:
+            if "skypeId" in statusLevel[0]:
+                logger.info(" [+] %s -- Legacy Skype Detected" % usernameToTry)
+                if usernameToTry not in validNames:
+                    validNames.add(usernameToTry)
+                    outfile.write(usernameToTry + "@" + args.targetDomain + "\n")
+                if usernameToTry not in legacyNames:
+                    legacyNames.add(usernameToTry)
+                    legOut.write(usernameToTry + "@" + args.targetDomain + "\n")
+                logger.debug(json.dumps(statusLevel, indent=2))
+            else:
+                if not args.teamsStatus:
                     logger.info(" [+] %s" % usernameToTry)
                     if usernameToTry not in validNames:
                         validNames.add(usernameToTry)
                         outfile.write(usernameToTry + "@" + args.targetDomain + "\n")
-                elif initRequest.status_code == 404:
-                    logger.debug(" Error with username - %s" % str(usernameToTry))
-                elif initRequest.status_code == 200:
-                    statusLevel = json.loads(initRequest.text)
-                    if statusLevel:
-                        if "skypeId" in statusLevel[0]:
-                            logger.info(" [+] %s -- Legacy Skype Detected" % usernameToTry)
-                            if usernameToTry not in validNames:
-                                validNames.add(usernameToTry)
-                                outfile.write(usernameToTry + "@" + args.targetDomain + "\n")
-                            if usernameToTry not in legacyNames:
-                                legacyNames.add(usernameToTry)
-                                legOut.write(usernameToTry + "@" + args.targetDomain + "\n")
-                            logger.debug(json.dumps(statusLevel, indent=2))
-                        else:
-                            if not args.teamsStatus:
-                                logger.info(" [+] %s" % usernameToTry)
-                                if usernameToTry not in validNames:
-                                    validNames.add(usernameToTry)
-                                    outfile.write(usernameToTry + "@" + args.targetDomain + "\n")
-                                logger.debug(json.dumps(statusLevel, indent=2))
-                        if args.teamsStatus:
-                            mriStatus = statusLevel[0].get("mri")
-                            availability, device_type, out_of_office_note = await getPresence(mriStatus, theToken)
-                            if out_of_office_note is None:
-                                logger.info(f" [+] %s -- %s -- %s" % (usernameToTry, availability, device_type))
-                                status = f"{usernameToTry} -- {availability} -- {device_type}"
-                                if status not in statusNames:
-                                    statusNames.add(status)
-                                    statusOut.write(status + "\n")
-                            if out_of_office_note is not None:
-                                logger.info(" [+] %s -- %s -- %s -- %s" % (usernameToTry, availability, device_type, repr(out_of_office_note)))
-                                status = f"{usernameToTry} -- {availability} -- {device_type} -- {repr(out_of_office_note)}"
-                                if status not in statusNames:
-                                    statusNames.add(status)
-                                    statusOut.write(status + "\n")
-                            if usernameToTry not in validNames:
-                                validNames.add(usernameToTry)
-                                outfile.write(usernameToTry + "@" + args.targetDomain + "\n")
-                    else:
-                        logger.debug(" [-] %s" % usernameToTry)
-                elif initRequest.status_code == 401:
-                    logger.error(" Error with Teams Auth Token... \n\tShutting down threads and Exiting")
-                    sys.exit()
-                bar()
+                    logger.debug(json.dumps(statusLevel, indent=2))
+            if args.teamsStatus:
+                mriStatus = statusLevel[0].get("mri")
+                availability, device_type, out_of_office_note = await getPresence(mriStatus, theToken)
+                if out_of_office_note is None:
+                    logger.info(f" [+] %s -- %s -- %s" % (usernameToTry, availability, device_type))
+                    status = f"{usernameToTry} -- {availability} -- {device_type}"
+                    if status not in statusNames:
+                        statusNames.add(status)
+                        statusOut.write(status + "\n")
+                if out_of_office_note is not None:
+                    logger.info(" [+] %s -- %s -- %s -- %s" % (usernameToTry, availability, device_type, repr(out_of_office_note)))
+                    status = f"{usernameToTry} -- {availability} -- {device_type} -- {repr(out_of_office_note)}"
+                    if status not in statusNames:
+                        statusNames.add(status)
+                        statusOut.write(status + "\n")
+                if usernameToTry not in validNames:
+                    validNames.add(usernameToTry)
+                    outfile.write(usernameToTry + "@" + args.targetDomain + "\n")
+        else:
+            logger.debug(" [-] %s" % usernameToTry)
+    elif initRequest.status_code == 401:
+        logger.error(" Error with Teams Auth Token... \n\tShutting down threads and Exiting")
+        sys.exit()
+    bar()
+
+async def TeamsEnumerator(theToken, bar):
+    global outfile
+    global legOut
+    global statusOut
+    global validNames
+    global USERNAMES_BATCHSIZE
+    
+    try:
+        limits = httpx.Limits(max_connections=args.max_connections_thread, max_keepalive_connections=args.max_connections_thread)
+        timeout = httpx.Timeout(connect=args.timeout, read=args.timeout, write=args.timeout, pool=None)
+        async with httpx.AsyncClient(verify=False, timeout=timeout, limits=limits) as client:
+            initHeaders = {
+                "Host": "teams.microsoft.com",
+                "Authorization": "Bearer " + theToken.strip(),
+                "X-Ms-Client-Version": CLIENT_VERSION_TEAMS,
+            }
+            while True:
+                tasks = []
+                usernamesToTry = [args.inputList.readline().strip().split("@")[0].lower() for _ in range(0, USERNAMES_BATCHSIZE)]
+                
+                if len(usernamesToTry) == 0:
+                    break
+
+                for usernameToTry in usernamesToTry:
+                    if usernameToTry == "":
+                        continue
+
+                    if usernameToTry in validNames: # Skip names that OneDrive enumeration has already found
+                        bar()
+                        continue
+
+                    tasks.append(
+                        teamsEnumeratorHandlerAsync(
+                            bar=bar,
+                            theToken=theToken,
+                            client=client,
+                            usernameToTry=usernameToTry,
+                            initHeaders=initHeaders
+                        )
+                    )
+
+                for taskResult in asyncio.as_completed(tasks):
+                    await taskResult
         
     except Exception as e:
-        logger.debug(" [V] " + str(e))
+        logger.error(" [V] " + str(e))
         pass      
 
 def start_mitmproxy(debug, exit_event):
@@ -333,10 +358,11 @@ def start_firefox(options):
     return driver
 
 def get_tenant_name(target_domain):
+    client = httpx.Client()
     logger.debug(" [V] Method 1: SharePoint Discovery...")
     try:
         sharepoint_url = f"https://{target_domain.split('.')[0]}-my.sharepoint.com"
-        response = requests.get(sharepoint_url, timeout=10, allow_redirects=False, verify=False)
+        response = client.get(sharepoint_url, timeout=args.timeout, follow_redirects=False, verify=False)
 
         if response.status_code == 302:
             location = response.headers.get('location', '')
@@ -367,7 +393,7 @@ def get_tenant_name(target_domain):
         logger.debug(f" [V] Testing pattern {i+1}: {pattern}")
         try:
             test_url = f"https://{pattern}-my.sharepoint.com"
-            test_response = requests.get(test_url, timeout=5, allow_redirects=False, verify=False)
+            test_response = client.get(test_url, timeout=5, allow_redirects=False, verify=False)
 
             if test_response.status_code in [302, 200, 401, 403]:
                 logger.debug(f" [V] SUCCESS: Found working tenant pattern: {pattern} (HTTP {test_response.status_code})")
@@ -381,6 +407,7 @@ def get_tenant_name(target_domain):
 
     fallback_tenant = target_domain.split('.')[0]
     logger.debug(f" [V] FALLBACK: Using domain-based tenant: {fallback_tenant}")
+    client.close()
     return fallback_tenant
 
 def getNumOfLinesInFile(f):
@@ -462,7 +489,7 @@ async def main():
     ###########
     if args.runOneDrive:
         try:
-            logger.debug(" [V] Running OneDrive Enumeration")
+            logger.info(" Running OneDrive Enumeration")
 
             try:
                 logger.debug(" [V] Discovering tenant for target domain")
@@ -472,7 +499,7 @@ async def main():
                     sys.exit()
             except Exception as e:
                 logger.error(" Error retrieving tenant for target, Exiting...")
-                logger.debug(" [V] " + str(e))
+                logger.error(" [V] " + str(e))
                 sys.exit()
 
             logger.debug(" [V] Using target tenant %s" % targetTenant)
@@ -486,7 +513,7 @@ async def main():
 
         except Exception as e:
             logger.error(" Error running OneDrive Enumeration")
-            logger.debug(" " + str(e))
+            logger.error(" " + str(e))
 
     ########
     ## Teams
@@ -533,18 +560,18 @@ async def main():
                 if "Bearer" in theToken:
                     theToken = theToken.replace("Bearer%3D","").replace("%26Origin%3Dhttps%3A%2F%2Fteams.microsoft.com","").replace("%26origin%3Dhttps%3A%2F%2Fteams.microsoft.com","").replace("Bearer ","").strip()
 
-            logger.debug(" Running Teams User Enumeration")
+            logger.info(" Running Teams User Enumeration")
             args.inputList.seek(0)
             
             with alive_bar(getNumOfLinesInFile(args.inputList), title="Enumerating Teams Users", enrich_print=False) as bar2:
-                await teamsEnum(
+                await TeamsEnumerator(
                     theToken,
                     bar2
                 )
 
         except Exception as e:
             logger.error(" Error running Teams Enumeration")
-            logger.debug(" " + str(e))
+            logger.error(" " + str(e))
 
     ####################
     ## Aggregate results
