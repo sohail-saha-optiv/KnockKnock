@@ -12,6 +12,7 @@ from threading import Thread, Event
 import httpx
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from time import sleep
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -76,6 +77,24 @@ statusNames = set()
 outfile = None
 legOut = None
 statusOut = None
+allDone = False
+
+# Periodically flushes all files; done to get partial results even if script throws errors and exits
+def flushFileBuffersPeriodically():
+    global outfile
+    global legOut
+    global statusOut
+    global allDone
+
+    while not allDone:
+        sleep(60)
+        for fileToFlush in [
+            outfile,
+            legOut,
+            statusOut
+        ]:
+            if fileToFlush is not None:
+                fileToFlush.flush()
 
 async def OneDriveEnumeratorHandlerAsync(usernameToTry, targetTenant, client, bar):
     logger.debug(" [V] Testing user %s" % usernameToTry)
@@ -506,6 +525,8 @@ def main():
 
             with alive_bar(getNumOfLinesInFile(args.inputList), title="Enumerating Teams Users", enrich_print=False) as bar:
                 with ThreadPoolExecutor(max_workers=args.maxThreads) as threadPoolExecutor:
+                    threadPoolExecutor.submit(flushFileBuffersPeriodically)
+                    
                     for threadNum in range(0, args.maxThreads):
                         threadPoolExecutor.submit(
                             asyncio.run,
@@ -569,6 +590,8 @@ def main():
             
             with alive_bar(getNumOfLinesInFile(args.inputList), title="Enumerating Teams Users", enrich_print=False) as bar2:
                 with ThreadPoolExecutor(max_workers=args.maxThreads) as threadPoolExecutor:
+                    threadPoolExecutor.submit(flushFileBuffersPeriodically)
+
                     for threadNum in range(0, args.maxThreads):
                         threadPoolExecutor.submit(
                             asyncio.run,
