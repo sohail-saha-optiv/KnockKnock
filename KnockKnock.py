@@ -83,7 +83,6 @@ outfile = None
 legOut = None
 statusOut = None
 allDone = False
-httpxAsyncClients: list[httpx.AsyncClient] = []
 
 # Periodically flushes all files; done to get partial results even if script throws errors and exits
 def flushFileBuffersPeriodically():
@@ -133,7 +132,19 @@ async def OneDriveEnumerator(targetTenant, bar):
     global legOut
     global statusOut
     global allDone
-    global httpxAsyncClients
+    
+    httpxAsyncClients = []
+    limits = httpx.Limits(max_connections=args.max_connections_thread, max_keepalive_connections=args.max_connections_thread)
+    timeout = httpx.Timeout(connect=args.timeout, read=None, write=None, pool=None)
+    if sshProxyManager is None:
+        httpxAsyncClients.append(
+                httpx.AsyncClient(verify=False, timeout=timeout, limits=limits)
+            )
+    else:
+        for proxy in sshProxyManager.proxies:
+            httpxAsyncClients.append(
+                httpx.AsyncClient(verify=False, timeout=timeout, limits=limits, proxy=proxy)
+            )
     
     try:
         while True:
@@ -151,7 +162,7 @@ async def OneDriveEnumerator(targetTenant, bar):
                     OneDriveEnumeratorHandlerAsync(
                         usernameToTry=usernameToTry,
                         targetTenant=targetTenant,
-                        client=random.choice(httpxAsyncClients),
+                        client=httpxAsyncClients[0] if len(httpxAsyncClients) == 1 else random.choice(httpxAsyncClients),
                         bar=bar
                         )
                 )
@@ -286,9 +297,21 @@ async def TeamsEnumerator(theToken, bar):
     global USERNAMES_BATCHSIZE
     global allDone
     global sshProxyManager
-    global httpxAsyncClients
     
     try:
+        httpxAsyncClients = []
+        limits = httpx.Limits(max_connections=args.max_connections_thread, max_keepalive_connections=args.max_connections_thread)
+        timeout = httpx.Timeout(connect=args.timeout, read=None, write=None, pool=None)
+        if sshProxyManager is None:
+            httpxAsyncClients.append(
+                    httpx.AsyncClient(verify=False, timeout=timeout, limits=limits)
+                )
+        else:
+            for proxy in sshProxyManager.proxies:
+                httpxAsyncClients.append(
+                    httpx.AsyncClient(verify=False, timeout=timeout, limits=limits, proxy=proxy)
+                )
+        
         initHeaders = {
             "Host": "teams.microsoft.com",
             "Authorization": "Bearer " + theToken.strip(),
@@ -322,7 +345,7 @@ async def TeamsEnumerator(theToken, bar):
                     TeamsEnumeratorHandlerAsync(
                         bar=bar,
                         theToken=theToken,
-                        client=random.choice(httpxAsyncClients),
+                        client=httpxAsyncClients[0] if len(httpxAsyncClients) == 1 else random.choice(httpxAsyncClients),
                         usernameToTry=usernameToTry,
                         initHeaders=initHeaders
                     )
@@ -406,9 +429,20 @@ def start_firefox(options):
     return driver
 
 def OneDriveGetTenantName(target_domain):
-    global httpxAsyncClients
+    httpxAsyncClients = []
+    limits = httpx.Limits(max_connections=args.max_connections_thread, max_keepalive_connections=args.max_connections_thread)
+    timeout = httpx.Timeout(connect=args.timeout, read=None, write=None, pool=None)
+    if sshProxyManager is None:
+        httpxAsyncClients.append(
+                httpx.AsyncClient(verify=False, timeout=timeout, limits=limits)
+            )
+    else:
+        for proxy in sshProxyManager.proxies:
+            httpxAsyncClients.append(
+                httpx.AsyncClient(verify=False, timeout=timeout, limits=limits, proxy=proxy)
+            )
 
-    client = httpx.Client(proxy=random.choice(httpxAsyncClients))
+    client = httpxAsyncClients[0] if len(httpxAsyncClients) == 1 else random.choice(httpxAsyncClients)
     logger.debug(" [V] Method 1: SharePoint Discovery...")
     try:
         sharepoint_url = f"https://{target_domain.split('.')[0]}-my.sharepoint.com"
@@ -477,7 +511,6 @@ def main():
     global statusOut
     global allDone
     global sshProxyManager
-    global httpxAsyncClients
 
     ##############################
     ## Setup SSH proxies if needed
@@ -494,21 +527,6 @@ def main():
         sshProxyManager = SSHProxyManager(ssh_configs=ssh_configs)
         sshProxyManager.start_tunnels()
         sshProxyManager.test_tunnels()
-
-    ######################
-    ## Setup HTTPX Clients
-    ######################
-    limits = httpx.Limits(max_connections=args.max_connections_thread, max_keepalive_connections=args.max_connections_thread)
-    timeout = httpx.Timeout(connect=args.timeout, read=None, write=None, pool=None)
-    if sshProxyManager is None:
-        httpxAsyncClients.append(
-                httpx.AsyncClient(verify=False, timeout=timeout, limits=limits)
-            )
-    else:
-        for proxy in sshProxyManager.proxies:
-            httpxAsyncClients.append(
-                httpx.AsyncClient(verify=False, timeout=timeout, limits=limits, proxy=proxy)
-            )
 
     #####################
     ## Setup output files

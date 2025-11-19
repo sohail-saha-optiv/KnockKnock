@@ -45,7 +45,7 @@ class SSHProxyManager:
                 '-o', 'UserKnownHostsFile=/dev/null',
                 '-o', 'ExitOnForwardFailure=yes',
                 '-o', 'ServerAliveInterval=60',  # Keeps the connection alive.
-                '-o', 'ConnectTimeout=10',       # Timeout for the initial connection.
+                '-o', 'ConnectTimeout=30',       # Timeout for the initial connection.
                 '-i', os.path.expanduser(config['private_key_path']),
                 '-D', str(local_port),
                 f"{config['username']}@{config['ip']}"
@@ -97,7 +97,7 @@ class SSHProxyManager:
                 try:
                     response = client.get(
                         url="http://httpbin.org/ip",
-                        timeout=10,
+                        timeout=30,
                         follow_redirects=True
                     )
                     responseJson = response.json()
