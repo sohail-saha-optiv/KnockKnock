@@ -158,7 +158,14 @@ async def OneDriveEnumerator(targetTenant, bar):
     try:
         while True:
             tasks = []
-            usernamesToTry = [args.inputList.readline().strip().split("@")[0].lower() for _ in range(0, USERNAMES_BATCHSIZE)]
+            usernamesToTry = []
+
+            for _ in range(0, USERNAMES_BATCHSIZE):
+                usernameToTry = args.inputList.readline().strip().split("@")[0].lower()
+                if usernameToTry == "":
+                    break
+                usernamesToTry.append(usernameToTry)
+
             if len(usernamesToTry) == 0:
                 break
             for usernameToTry in usernamesToTry:
