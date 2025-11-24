@@ -435,20 +435,20 @@ def start_firefox(options):
     return driver
 
 def OneDriveGetTenantName(target_domain):
-    httpxAsyncClients = []
+    httpxSyncClients = []
     limits = httpx.Limits(max_connections=args.max_connections_thread, max_keepalive_connections=args.max_connections_thread)
     timeout = httpx.Timeout(connect=args.timeout, read=None, write=None, pool=None)
     if sshProxyManager is None:
-        httpxAsyncClients.append(
-                httpx.AsyncClient(verify=False, timeout=timeout, limits=limits)
+        httpxSyncClients.append(
+                httpx.Client(verify=False, timeout=timeout, limits=limits)
             )
     else:
         for proxy in sshProxyManager.proxies:
-            httpxAsyncClients.append(
-                httpx.AsyncClient(verify=False, timeout=timeout, limits=limits, proxy=proxy)
+            httpxSyncClients.append(
+                httpx.Client(verify=False, timeout=timeout, limits=limits, proxy=proxy)
             )
 
-    client = httpxAsyncClients[0] if len(httpxAsyncClients) == 1 else random.choice(httpxAsyncClients)
+    client = httpxSyncClients[0] if len(httpxSyncClients) == 1 else random.choice(httpxSyncClients)
     logger.debug(" [V] Method 1: SharePoint Discovery...")
     try:
         sharepoint_url = f"https://{target_domain.split('.')[0]}-my.sharepoint.com"
