@@ -452,7 +452,7 @@ def OneDriveGetTenantName(target_domain):
     logger.debug(" [V] Method 1: SharePoint Discovery...")
     try:
         sharepoint_url = f"https://{target_domain.split('.')[0]}-my.sharepoint.com"
-        response = client.get(sharepoint_url, timeout=args.timeout, follow_redirects=False, verify=False)
+        response = client.get(sharepoint_url, timeout=args.timeout, follow_redirects=False)
 
         if response.status_code == 302:
             location = response.headers.get('location', '')
@@ -483,7 +483,7 @@ def OneDriveGetTenantName(target_domain):
         logger.debug(f" [V] Testing pattern {i+1}: {pattern}")
         try:
             test_url = f"https://{pattern}-my.sharepoint.com"
-            test_response = client.get(test_url, timeout=args.timeout, allow_redirects=False, verify=False)
+            test_response = client.get(test_url, timeout=args.timeout, allow_redirects=False)
 
             if test_response.status_code in [302, 200, 401, 403]:
                 logger.debug(f" [V] SUCCESS: Found working tenant pattern: {pattern} (HTTP {test_response.status_code})")
